@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..pipeline import ConvertOptions
-from ..service import convert_batch, make_runner, report_path_for
+from ..service import convert_batch, group_inputs, report_path_for
 
 log = logging.getLogger(__name__)
 
@@ -64,13 +64,11 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, root: Path, transport_factory=None):
+    def __init__(self, root: Path):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
-        # tests inject a fake Claude transport here
-        self.transport_factory = transport_factory
 
     def get(self, job_id: str) -> Job | None:
         return self.jobs.get(job_id)
@@ -88,33 +86,33 @@ class JobManager:
     # ------------------------------------------------------------------ convert
     def start_conversion(self, files: list[tuple[str, bytes]], options: ConvertOptions,
                          per_paper: list[dict] | None = None, combine_title: str | None = None,
-                         api_key: str | None = None) -> Job:
+                         images_are_one_paper: bool = False) -> Job:
         job = self._new_job("convert")
         job.combine_title = combine_title or None
-        pdfs = []
+        saved = []
         for i, (name, data) in enumerate(files, start=1):
             path = job.workdir / "input" / f"{i:02d}_{safe_name(name, 'paper.pdf')}"
             path.write_bytes(data)
-            pdfs.append(path)
-            job.papers.append(PaperEntry(index=i - 1, pdf_path=path))
+            saved.append(path)
+        inputs = group_inputs(saved, images_are_one_paper, job.workdir / "input")
+        for i, path in enumerate(inputs):
+            job.papers.append(PaperEntry(index=i, pdf_path=path))
         per_opts = None
         if per_paper:
             per_opts = []
-            for i in range(len(pdfs)):
+            for i in range(len(inputs)):
                 o = per_paper[i] if i < len(per_paper) else {}
                 per_opts.append(ConvertOptions(**{**options.__dict__, **{k: v for k, v in o.items() if v not in
                                                                         (None, "")}}))
-        thread = threading.Thread(target=self._run, args=(job, pdfs, options, per_opts, api_key), daemon=True)
+        thread = threading.Thread(target=self._run, args=(job, inputs, options, per_opts), daemon=True)
         thread.start()
         return job
 
-    def _run(self, job: Job, pdfs: list[Path], options: ConvertOptions, per_opts, api_key: str | None) -> None:
+    def _run(self, job: Job, inputs: list[Path], options: ConvertOptions, per_opts) -> None:
         job.status = "running"
-        job.add_log("start", f"Converting {len(pdfs)} paper(s) with {options.model} (effort {options.effort})")
+        job.add_log("start", f"Converting {len(inputs)} paper(s) on this computer (no AI, no internet)")
         try:
-            transport = self.transport_factory() if self.transport_factory else None
-            runner = make_runner(options, api_key=api_key, transport=transport)
-            batch = convert_batch(pdfs, job.workdir / "output", options, runner, combine_title=job.combine_title,
+            batch = convert_batch(inputs, job.workdir / "output", options, combine_title=job.combine_title,
                                   progress=job.add_log, per_paper_options=per_opts)
         except Exception as exc:  # noqa: BLE001
             log.exception("job %s failed", job.id)
@@ -122,8 +120,8 @@ class JobManager:
             job.error = f"{type(exc).__name__}: {exc}"
             job.add_log("error", job.error)
             return
-        # convert_batch processes PDFs in order: successes arrive in order,
-        # failures are reported by PDF name.
+        # convert_batch processes inputs in order: successes arrive in order,
+        # failures are reported by input name.
         results = list(batch.results)
         failures = dict(batch.failures)
         for entry in job.papers:
@@ -134,12 +132,13 @@ class JobManager:
             if results:
                 r = results.pop(0)
                 entry.out_path = r.output_path
+                entry.pdf_path = r.source_pdf or entry.pdf_path
                 entry.summary = r.summary()
                 entry.detail = _load_detail(r.output_path)
         job.combined_path = batch.combined_path
         if batch.combined_report is not None:
             job.combined_report = batch.combined_report.to_dict()
-        job.status = "done" if not batch.failures else ("failed" if not batch.results else "done")
+        job.status = "done" if batch.results else "failed"
         if batch.failures:
             job.error = "; ".join(f"{n}: {e}" for n, e in batch.failures)
         job.add_log("done", "All done" if not batch.failures else "Finished with failures")

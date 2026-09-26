@@ -19,9 +19,10 @@ from PIL import Image
 from pydantic import ValidationError
 
 from ..browser import playwright_available
-from ..llm import DEFAULT_MODEL, SUPPORTED_MODELS
+from ..ocr import find_tessdata
 from ..pdf import Box, PdfDocument
 from ..pipeline import ConvertOptions
+from ..ocr import is_image_file
 from ..schema import load_paper_dict
 from ..service import save_edited_paper
 from ..validator import validate_paper
@@ -31,11 +32,29 @@ STATIC = Path(__file__).resolve().parent / "static"
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 
 
-def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
+def _is_picture(data: bytes) -> bool:
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def create_app(workdir: Path | None = None) -> FastAPI:
     app = FastAPI(title="TMUA paper converter")
     root = Path(workdir or os.environ.get("TMUA_WORKDIR", "tmua_output")).resolve()
-    jobs = JobManager(root, transport_factory=transport_factory)
+    jobs = JobManager(root)
     app.state.jobs = jobs
+
+    docs: dict[str, PdfDocument] = {}
+
+    def open_doc(path: Path) -> PdfDocument:
+        """Documents stay open so OCR'd pages are not read again on every request."""
+        key = str(path)
+        if key not in docs:
+            docs[key] = PdfDocument(path)
+        return docs[key]
 
     def job_or_404(job_id: str):
         job = jobs.get(job_id)
@@ -51,10 +70,7 @@ def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
 
     @app.get("/api/config")
     def config():
-        return {"has_api_key": bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-                                    or transport_factory),
-                "default_model": os.environ.get("TMUA_MODEL", DEFAULT_MODEL), "models": SUPPORTED_MODELS,
-                "render_check": playwright_available(), "workdir": str(root)}
+        return {"ocr": find_tessdata() is not None, "render_check": playwright_available(), "workdir": str(root)}
 
     @app.post("/api/jobs")
     async def create_job(files: list[UploadFile] = File(...), options: str = Form("{}")):
@@ -67,17 +83,19 @@ def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
             data = await f.read()
             if len(data) > MAX_UPLOAD_BYTES:
                 raise HTTPException(413, f"{f.filename} is too large")
-            if not data.startswith(b"%PDF"):
-                raise HTTPException(400, f"{f.filename} is not a PDF")
-            uploads.append((f.filename or "paper.pdf", data))
+            name = f.filename or "paper.pdf"
+            if data.startswith(b"%PDF"):
+                if not name.lower().endswith(".pdf"):
+                    name += ".pdf"
+            elif _is_picture(data):
+                if not is_image_file(name):
+                    name += ".png"
+            else:
+                raise HTTPException(400, f"{f.filename} is not a PDF or a picture")
+            uploads.append((name, data))
         if not uploads:
             raise HTTPException(400, "no files uploaded")
-        effort = opts.get("effort") or "high"
-        if effort not in ("low", "medium", "high", "xhigh", "max"):
-            raise HTTPException(400, "invalid effort")
-        base = ConvertOptions(model=opts.get("model") or os.environ.get("TMUA_MODEL", DEFAULT_MODEL), effort=effort,
-                              concurrency=int(opts.get("concurrency") or 4),
-                              render_check=bool(opts.get("render_check", True)))
+        base = ConvertOptions(render_check=bool(opts.get("render_check", True)))
         per_paper = []
         for p in opts.get("papers") or []:
             per_paper.append({
@@ -88,10 +106,11 @@ def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
                 "expected_questions": int(p["questions"]) if str(p.get("questions") or "").strip() else None,
             })
         combine = (opts.get("combine_title") or "").strip() or None
+        pages = bool(opts.get("images_are_pages"))
         if combine and len(uploads) < 2:
-            raise HTTPException(400, "combining needs at least two PDFs")
+            raise HTTPException(400, "combining needs at least two papers")
         job = jobs.start_conversion(uploads, base, per_paper=per_paper, combine_title=combine,
-                                    api_key=(opts.get("api_key") or "").strip() or None)
+                                    images_are_one_paper=pages)
         return {"id": job.id}
 
     @app.post("/api/review")
@@ -154,15 +173,15 @@ def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
         q = next((q for q in data.get("questions", []) if q.get("number") == number), None)
         if q is None:
             raise HTTPException(404, "no such question")
-        with PdfDocument(entry.pdf_path) as doc:
-            regions = [(int(p), Box(*b)) for p, b in entry.detail.get(str(number), {}).get("regions", [])]
-            if not regions:
-                regions = doc.question_regions(number)
-            if not regions:
-                page = int(q.get("sourcePage") or 1)
-                page = min(max(page, 1), doc.page_count)
-                regions = [(page, doc.page_box(page))]
-            parts = [doc.render(p, 2.5, b) for p, b in regions]
+        doc = open_doc(entry.pdf_path)
+        regions = [(int(p), Box(*b)) for p, b in entry.detail.get(str(number), {}).get("regions", [])]
+        if not regions:
+            regions = doc.question_regions(number)
+        if not regions:
+            page = int(q.get("sourcePage") or 1)
+            page = min(max(page, 1), doc.page_count)
+            regions = [(page, doc.page_box(page))]
+        parts = [doc.render(p, 2.5, b) for p, b in regions]
         width = max(im.width for im in parts)
         out = Image.new("RGB", (width, sum(im.height for im in parts) + 12 * (len(parts) - 1)), "white")
         y = 0
@@ -196,8 +215,7 @@ def create_app(workdir: Path | None = None, transport_factory=None) -> FastAPI:
 
     def _validate(data: dict, entry):
         if entry.pdf_path is not None:
-            with PdfDocument(entry.pdf_path) as doc:
-                return validate_paper(data, pdf=doc)
+            return validate_paper(data, pdf=open_doc(entry.pdf_path))
         return validate_paper(data)
 
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

@@ -1,117 +1,161 @@
-"""End-to-end conversion of the sample paper with a scripted Claude."""
+"""End-to-end conversion of LaTeX-typeset papers against their known-correct transcription."""
 
 import json
+import re
+from pathlib import Path
 
+import pymupdf
 import pytest
-from conftest import CHROMIUM
-from fake_claude import FakeTransport, Script
-from make_sample_paper import EXPECTED
 
-from tmua_converter.combine import combine_papers
-from tmua_converter.llm import ClaudeRunner
-from tmua_converter.naming import paper_filename, paper_id
-from tmua_converter.pipeline import ConvertOptions, convert_pdf
-from tmua_converter.schema import Paper, load_paper_dict
+from tmua_converter.ocr import find_tessdata
+from tmua_converter.pipeline import ConvertOptions, convert_pdf, parse_duration, parse_question_count
+from tmua_converter.schema import load_paper_dict
 from tmua_converter.validator import validate_paper
 
-
-def run(sample_pdf, tmp_path, script=None, **opts):
-    transport = FakeTransport(sample_pdf, script)
-    runner = ClaudeRunner(transport, model="claude-opus-5")
-    options = ConvertOptions(concurrency=2, render_check=CHROMIUM, **opts)
-    return convert_pdf(sample_pdf, runner, options, out_dir=tmp_path), transport
+DATA = Path(__file__).parent / "data"
+EXPECTED = json.loads((DATA / "latex_expected.json").read_text(encoding="utf-8"))
+needs_ocr = pytest.mark.skipif(find_tessdata() is None, reason="Tesseract OCR not installed")
 
 
-@pytest.fixture(scope="module")
-def converted(sample_pdf, tmp_path_factory):
-    return run(sample_pdf, tmp_path_factory.mktemp("out"))
+def norm(s: str) -> str:
+    """Compare maths ignoring spacing and optional braces around one-character scripts."""
+    s = s.replace("\\leq", "\\le").replace("\\geq", "\\ge").replace("\\neq", "\\ne").replace("\\,", " ")
+    s = re.sub(r"\^\{(.)\}", r"^\1", s)
+    s = re.sub(r"_\{(.)\}", r"_\1", s)
+    return re.sub(r"\s+", "", s)
 
 
-def test_output_matches_source(converted):
-    res, _ = converted
+def convert(pdf, tmp_path, **kw):
+    return convert_pdf(pdf, ConvertOptions(render_check=False, **kw), out_dir=tmp_path)
+
+
+@pytest.mark.parametrize("variant", ["cm", "times", "unicode"])
+def test_every_question_exact(variant, tmp_path):
+    """Three typesetting styles: LaTeX fonts, Times, Word-style Unicode maths (options across the line)."""
+    res = convert(DATA / f"latex_{variant}.pdf", tmp_path)
     data = load_paper_dict(res.output_path)
-    assert res.output_path.name == "Sample_Mathematics_Admissions_Paper_Paper_1.tmua.json"
-    assert list(data) == ["formatVersion", "id", "title", "paper", "year", "durationMinutes", "questions"]
-    assert data["formatVersion"] == 1 and data["durationMinutes"] == 40 and data["paper"] == "Paper 1"
+    assert (data["title"], data["paper"], data["year"], data["durationMinutes"]) == \
+        (EXPECTED["title"], "Paper 1", "2026", 75)
     assert len(data["questions"]) == len(EXPECTED["questions"])
-    for q, truth in zip(data["questions"], EXPECTED["questions"]):
-        assert q["number"] == truth["number"]
-        assert q["stem"] == truth["stem"]
-        assert [o["content"] for o in q["options"]] == truth["options"]
-        assert [o["label"] for o in q["options"]] == [chr(65 + i) for i in range(len(truth["options"]))]
-        assert q["sourcePage"] == truth["page"]
-        assert q["needsReview"] is False
-        assert bool(q["images"]) == ("figure" in truth)
-        assert "correctAnswer" not in q
+    for q, e in zip(data["questions"], EXPECTED["questions"]):
+        assert norm(q["stem"]) == norm(e["stem"]), (q["number"], q["stem"])
+        assert [o["label"] for o in q["options"]] == [o["label"] for o in e["options"]]
+        assert [norm(o["content"]) for o in q["options"]] == [norm(o["content"]) for o in e["options"]], q["number"]
+        assert bool(q["images"]) == e["has_image"], q["number"]
+        assert q["needsReview"] is False, (q["number"], res.questions[q["number"]].review_reasons)
+    assert res.report.ok, res.report.format()
 
 
-def test_written_file_escaping(converted):
-    res, _ = converted
+def test_written_file_escaping_and_pages(tmp_path):
+    res = convert(DATA / "latex_cm.pdf", tmp_path)
     raw = res.output_path.read_text(encoding="utf-8")
     data = json.loads(raw)
     stem = data["questions"][0]["stem"]
-    assert "\n\n" in stem and "\\n" not in stem          # real newlines after parsing
-    assert "\\frac" in stem and "\\\\frac" not in stem    # exactly one backslash after parsing
-    assert '\\\\frac' in raw                               # ...which is escaped once in the raw file
+    assert "\n\n" in stem and "\\n" not in stem
+    assert "\\frac" in stem and "\\\\frac" not in stem and "\\\\frac" in raw
+    assert [q["sourcePage"] for q in data["questions"]] == [2, 2, 3, 5, 5, 6, 6, 7]
+    assert "correctAnswer" not in raw
+    # question 7's options are printed on the next page
+    assert res.questions[7].regions[-1][0] == 7
+    with pymupdf.open(DATA / "latex_cm.pdf"):
+        pass
 
 
-def test_pass2_fixed_injected_error_and_all_passes_ran(converted):
-    res, transport = converted
-    h1 = res.questions[1].history
-    assert any("Pass 2 round 1: corrected" in h for h in h1)
-    assert any(h.startswith("Pass 3") for h in h1)
-    tasks = [next(t["name"] for t in c["tools"] if t["name"].startswith("submit")) for c in transport.calls]
-    assert tasks.count("submit_verification") >= 2 * len(EXPECTED["questions"])  # pass 2 + pass 3 for every question
-    assert tasks.count("submit_figure_check") == 2
+def test_figures_are_tight_crops(tmp_path):
+    res = convert(DATA / "latex_cm.pdf", tmp_path)
+    for n in (2, 3, 8):
+        f = res.questions[n].figures[0]
+        assert f.crop.metrics["edges_cutting_ink"] == []
+        assert f.crop.metrics["whitespace_fraction"] < 0.4
+        assert f.crop.metrics["page_height_fraction"] < 0.3
+    assert res.questions[3].figures[0].labels == ["A", "B", "C", "D"]
 
 
-def test_final_validation_on_reloaded_file(converted, sample_pdf):
-    res, _ = converted
-    assert res.report.ok, res.report.format()
-    from tmua_converter.pdf import PdfDocument
-    with PdfDocument(sample_pdf) as doc:
-        assert validate_paper(load_paper_dict(res.output_path), expected_questions=4, expected_duration=40,
-                              pdf=doc).ok
-    assert res.summary()["questions_with_images"] == [2, 3]
+def test_checks_catch_a_wrong_character(tmp_path):
+    """Pass 2 compares the output with the characters printed in the PDF."""
+    from tmua_converter import pipeline
+
+    res = convert(DATA / "latex_cm.pdf", tmp_path)
+    q = res.questions[1]
+    q.stem = q.stem.replace("x + 1", "x + 7")
+    q.review_reasons.clear()
+    conv = pipeline.Converter(ConvertOptions(render_check=False))
+    conv.doc = pipeline.PdfDocument(DATA / "latex_cm.pdf")
+    conv._glyph_cache, conv._ignored, conv._ocr_rules = {}, set(), {}
+    conv._cross_check(q)
+    assert any("missing 1" in r and "extra 7" in r for r in q.review_reasons)
 
 
-def test_images_are_real_crops(converted):
-    res, _ = converted
-    for n in (2, 3):
-        fig = res.questions[n].figures[0]
-        assert fig.confirmed
-        assert fig.crop.metrics["edges_cutting_ink"] == []
-        assert fig.crop.metrics["whitespace_fraction"] < 0.35
-        assert fig.crop.metrics["page_height_fraction"] < 0.35
+def test_metadata_parsing():
+    assert parse_duration("Time allowed: 1 hour 15 minutes")[0] == 75
+    assert parse_duration("You have 75 minutes")[0] == 75
+    assert parse_duration("Time: 2 hours")[0] == 120
+    assert parse_question_count("There are twenty questions")[0] == 20
+    assert parse_question_count("This paper has 16 multiple-choice questions")[0] == 16
 
 
-def test_non_converging_verification_flags_question(sample_pdf, tmp_path):
-    res, _ = run(sample_pdf, tmp_path, Script(verifier_always_corrects={4}), max_verify_rounds=2,
-                 max_pass3_rounds=1)
-    data = load_paper_dict(res.output_path)
-    q4 = data["questions"][3]
-    assert q4["needsReview"] is True
-    assert res.questions[4].review_reasons
-    assert all(not q["needsReview"] for q in data["questions"][:3])
-
-
-def test_overrides(sample_pdf, tmp_path):
-    res, _ = run(sample_pdf, tmp_path, title="Hercules Set 2", paper="Paper 1", year="Set 2", duration_minutes=75,
-                 filename="custom.tmua.json")
+def test_overrides(tmp_path):
+    res = convert(DATA / "latex_cm.pdf", tmp_path, title="Hercules Set 2", paper="Paper 2", year="Set 2",
+                  duration_minutes=90, filename="custom.tmua.json")
     data = load_paper_dict(res.output_path)
     assert res.output_path.name == "custom.tmua.json"
-    assert (data["title"], data["year"], data["durationMinutes"]) == ("Hercules Set 2", "Set 2", 75)
+    assert (data["title"], data["paper"], data["year"], data["durationMinutes"]) == \
+        ("Hercules Set 2", "Paper 2", "Set 2", 90)
 
 
-def test_combine_and_naming(converted):
-    res, _ = converted
-    p = res.paper
-    combined = combine_papers([p, p], "My Combined Paper")
-    assert [q.number for q in combined.questions] == list(range(1, 9))
-    assert combined.title == "My Combined Paper" and combined.durationMinutes == 80
-    assert combined.questions[4].stem == p.questions[0].stem
-    assert validate_paper(combined.model_dump(mode="json"), expected_questions=8).ok
-    assert paper_filename("Hercules Set 2", "Paper 1") == "Hercules_Set_2_Paper_1.tmua.json"
-    assert paper_filename("TMUA 2019 Paper 1", "Paper 1") == "TMUA_2019_Paper_1.tmua.json"
-    assert paper_id("Hercules Set 2", "Paper 2") == "hercules-set-2-paper-2"
-    Paper.model_validate(combined.model_dump())
+# ------------------------------------------------------------------------ pictures (OCR)
+@needs_ocr
+def test_pasted_screenshot_question(tmp_path):
+    """Question 1 is a pasted picture: read with OCR and flagged; the rest stays exact."""
+    res = convert(DATA / "latex_mixed.pdf", tmp_path)
+    data = load_paper_dict(res.output_path)
+    q1 = data["questions"][0]
+    assert q1["stem"].startswith("Find the complete set of values of")
+    assert [o["label"] for o in q1["options"]] == list("ABCDE")
+    assert q1["needsReview"] is True
+    for q, e in zip(data["questions"][1:], EXPECTED["questions"][1:]):
+        assert norm(q["stem"]) == norm(e["stem"])
+        assert q["needsReview"] is False
+
+
+@needs_ocr
+def test_scanned_paper(tmp_path):
+    src = pymupdf.open(DATA / "latex_cm.pdf")
+    scan = pymupdf.open()
+    for pg in src:
+        page = scan.new_page(width=pg.rect.width, height=pg.rect.height)
+        page.insert_image(page.rect, pixmap=pg.get_pixmap(dpi=200, colorspace=pymupdf.csGRAY))
+    scan.save(tmp_path / "scan.pdf")
+    res = convert(tmp_path / "scan.pdf", tmp_path)
+    data = load_paper_dict(res.output_path)
+    assert data["durationMinutes"] == 75
+    assert [q["sourcePage"] for q in data["questions"]] == [2, 2, 3, 5, 5, 6, 6, 7]
+    assert all(q["needsReview"] for q in data["questions"])  # OCR'd maths is always checked by a person
+    assert [q["number"] for q in data["questions"] if q["images"]] == [2, 3, 8]
+    assert [o["content"] for o in data["questions"][2]["options"]] == ["Graph A", "Graph B", "Graph C", "Graph D"]
+    assert data["questions"][4]["stem"].startswith("Consider the following statements")
+    # anything OCR could not read at all is left empty (never invented) and the question is flagged
+    for issue in validate_paper(data).errors:
+        assert issue.code == "empty" and data["questions"][issue.question - 1]["needsReview"]
+
+
+@needs_ocr
+def test_photo_input(tmp_path):
+    png = tmp_path / "photo.png"
+    pymupdf.open(DATA / "latex_cm.pdf")[1].get_pixmap(dpi=200).save(png)
+    res = convert(png, tmp_path)
+    data = load_paper_dict(res.output_path)
+    assert [q["number"] for q in data["questions"]] == [1, 2]
+    assert [len(q["options"]) for q in data["questions"]] == [5, 4]
+    assert data["questions"][1]["images"]
+    assert res.output_path.name == "photo_Paper_1.tmua.json"
+
+
+def test_picture_without_ocr_gives_clear_error(tmp_path, monkeypatch):
+    import tmua_converter.ocr as ocr
+
+    monkeypatch.setattr(ocr, "find_tessdata", lambda: None)
+    png = tmp_path / "photo.png"
+    pymupdf.open(DATA / "latex_cm.pdf")[1].get_pixmap(dpi=100).save(png)
+    with pytest.raises(Exception, match="Tesseract"):
+        convert(png, tmp_path)

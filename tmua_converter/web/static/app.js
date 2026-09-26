@@ -41,13 +41,10 @@ async function homeView() {
   show("#tpl-home");
   const files = []; // {file, o: {title, paper, year, duration, questions}}
   const cfg = (await api("/api/config")).body;
-  const modelSel = $("#model");
-  const models = [cfg.default_model, ...cfg.models.filter((m) => m !== cfg.default_model)];
-  modelSel.innerHTML = models.map((m) => `<option>${esc(m)}</option>`).join("");
-  $("#key-row").hidden = cfg.has_api_key;
-  $("#render-note").textContent = cfg.render_check
-    ? "Rendered-preview check: on (each question is rendered with KaTeX and compared with the PDF)."
-    : "Rendered-preview check: off - install playwright and Chromium to compare KaTeX renders with the PDF.";
+  $("#ocr-note").textContent = cfg.ocr
+    ? "Pictures (scans, photos, screenshots) are read with free offline OCR. OCR is weak on maths symbols, so every question read from a picture is marked for review."
+    : "To convert pictures (scans, photos, screenshots), install the free Tesseract OCR program first - see the README. Digital PDFs work without it.";
+  const isPic = (f) => !(f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf"));
 
   const list = $("#file-list");
   function renderFiles() {
@@ -80,7 +77,8 @@ async function homeView() {
   }
   function addFiles(fl) {
     for (const f of fl) {
-      if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")) {
+      const pdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+      if (pdf || (f.type || "").startsWith("image/") || /\.(png|jpe?g|webp|tiff?|bmp)$/i.test(f.name)) {
         files.push({ file: f, o: { title: "", paper: "", year: "", duration: "", questions: "" } });
       }
     }
@@ -95,13 +93,17 @@ async function homeView() {
   const combine = $("#combine");
   combine.addEventListener("change", () => { $("#combine-row").hidden = !combine.checked; updateStart(); });
   $("#combine-title").addEventListener("input", updateStart);
-  $("#api-key").addEventListener("input", updateStart);
+  $("#pages").addEventListener("change", updateStart);
+  function paperCount() {
+    const pics = files.filter((f) => isPic(f.file)).length;
+    return files.length - pics + (pics && $("#pages").checked ? 1 : pics);
+  }
   function updateStart() {
+    $("#pages-row").hidden = files.filter((f) => isPic(f.file)).length < 2;
     let msg = "";
-    if (!files.length) msg = "Add at least one PDF.";
-    else if (combine.checked && files.length < 2) msg = "Combining needs at least two PDFs.";
+    if (!files.length) msg = "Add at least one PDF or picture.";
+    else if (combine.checked && paperCount() < 2) msg = "Combining needs at least two papers.";
     else if (combine.checked && !$("#combine-title").value.trim()) msg = "Enter the combined paper's title.";
-    else if (!cfg.has_api_key && !$("#api-key").value.trim()) msg = "Enter an API key.";
     $("#start").disabled = !!msg;
     $("#start-msg").textContent = msg;
   }
@@ -112,9 +114,8 @@ async function homeView() {
     const fd = new FormData();
     files.forEach((f) => fd.append("files", f.file, f.file.name));
     fd.append("options", JSON.stringify({
-      model: modelSel.value, effort: $("#effort").value,
       combine_title: combine.checked ? $("#combine-title").value.trim() : "",
-      api_key: $("#api-key").value.trim(), papers: files.map((f) => f.o),
+      images_are_pages: $("#pages").checked, papers: files.map((f) => f.o),
     }));
     try {
       const { body } = await api("/api/jobs", { method: "POST", body: fd });
@@ -193,13 +194,12 @@ function renderResults(job) {
     html += `<div class="result">
       <h3>${esc(p.file)} ${pill}</h3>
       <ul>
-        <li>${s.questions} questions · ${s.durationMinutes} minutes · from ${esc(p.pdf.replace(/^\d+_/, ""))}</li>
-        <li>Every question visually cross-checked against the PDF pages: transcription, independent verification${s.render_check_used ? " (with KaTeX render comparison)" : ""}, and a re-check of the written file</li>
+        <li>${s.questions} questions · ${s.durationMinutes} minutes · from ${esc(p.pdf.replace(/^\d+_/, "").replace(".source.pdf", ""))}</li>
+        <li>Every question checked: rebuilt from the page layout, cross-checked character by character against the PDF${s.render_check_used ? ", every expression rendered with KaTeX" : ""}</li>
         <li>Final file reloaded with a JSON parser and validated: ${v.errors} errors, ${v.warnings} warnings</li>
         <li>Questions with source images: ${s.questions_with_images.length ? s.questions_with_images.join(", ") : "none"}</li>
         <li>Needs review: ${flagged.length ? flagged.map(([n, r]) => `<br>Q${esc(n)} - ${esc(r.join("; "))}`).join("") : "none"}</li>
         ${(s.notes || []).map((n) => `<li class="muted">${esc(n)}</li>`).join("")}
-        <li class="muted">API usage: ${s.usage.requests} requests${s.usage.estimated_cost_usd != null ? ` · about $${s.usage.estimated_cost_usd.toFixed(2)}` : ""}</li>
       </ul>
       <div class="actions">
         <a class="button" href="#/job/${job.id}/paper/${p.index}">Review &amp; edit</a>

@@ -1,0 +1,216 @@
+{
+  "title": "Sample Admissions Test Paper 1",
+  "paper": "Paper 1",
+  "year": "2026",
+  "durationMinutes": 75,
+  "questions": [
+    {
+      "number": 1,
+      "stem": "Find the complete set of values of $x$ for which\n\n$$\\frac{x^2 - 4}{x + 1} \\le 0$$",
+      "options": [
+        {
+          "label": "A",
+          "content": "$x \\le -2$"
+        },
+        {
+          "label": "B",
+          "content": "$-2 \\le x < -1$ or $x \\ge 2$"
+        },
+        {
+          "label": "C",
+          "content": "$x \\le -2$ or $-1 < x \\le 2$"
+        },
+        {
+          "label": "D",
+          "content": "$-1 < x \\le 2$"
+        },
+        {
+          "label": "E",
+          "content": "$x \\ge 2$"
+        }
+      ],
+      "has_image": false
+    },
+    {
+      "number": 2,
+      "stem": "The diagram shows triangle $ABC$ with $AB = 9/\\sqrt{2}$ and angle $BAC = 45^\\circ$.\n\nWhat is the area of triangle $ABC$?",
+      "options": [
+        {
+          "label": "A",
+          "content": "$\\frac{81}{4}$"
+        },
+        {
+          "label": "B",
+          "content": "$\\frac{81}{2}$"
+        },
+        {
+          "label": "C",
+          "content": "$\\frac{81\\sqrt{2}}{4}$"
+        },
+        {
+          "label": "D",
+          "content": "$81$"
+        }
+      ],
+      "has_image": true
+    },
+    {
+      "number": 3,
+      "stem": "Which one of the following could be the graph of $y = x^3 - x$?",
+      "options": [
+        {
+          "label": "A",
+          "content": "Graph A"
+        },
+        {
+          "label": "B",
+          "content": "Graph B"
+        },
+        {
+          "label": "C",
+          "content": "Graph C"
+        },
+        {
+          "label": "D",
+          "content": "Graph D"
+        }
+      ],
+      "has_image": true
+    },
+    {
+      "number": 4,
+      "stem": "Evaluate\n\n$$\\sum_{k=1}^{10} \\log_2 \\left(\\frac{k + 1}{k}\\right)$$",
+      "options": [
+        {
+          "label": "A",
+          "content": "$\\log_2 11$"
+        },
+        {
+          "label": "B",
+          "content": "$\\log_2 10$"
+        },
+        {
+          "label": "C",
+          "content": "$1 + \\log_2 11$"
+        },
+        {
+          "label": "D",
+          "content": "$11$"
+        },
+        {
+          "label": "E",
+          "content": "$\\log_{10} 2$"
+        }
+      ],
+      "has_image": false
+    },
+    {
+      "number": 5,
+      "stem": "Consider the following statements about the function $f(x) = |x - 1| - 2$:\n\nI $f(-1) = 0$\n\nII $f(x) \\ge -2$ for all real $x$\n\nIII the equation $f(x) = 1$ has exactly two solutions\n\nWhich of these statements is/are true?",
+      "options": [
+        {
+          "label": "A",
+          "content": "none of them"
+        },
+        {
+          "label": "B",
+          "content": "I only"
+        },
+        {
+          "label": "C",
+          "content": "II only"
+        },
+        {
+          "label": "D",
+          "content": "I and II only"
+        },
+        {
+          "label": "E",
+          "content": "I, II and III"
+        }
+      ],
+      "has_image": false
+    },
+    {
+      "number": 6,
+      "stem": "Given that $\\int_0^a (3x^2 - 2x) dx = 4$ where $a > 0$, find the value of $a$.",
+      "options": [
+        {
+          "label": "A",
+          "content": "$1$"
+        },
+        {
+          "label": "B",
+          "content": "$2$"
+        },
+        {
+          "label": "C",
+          "content": "$\\frac{1 + \\sqrt{17}}{2}$"
+        },
+        {
+          "label": "D",
+          "content": "$\\sqrt{3}$"
+        },
+        {
+          "label": "E",
+          "content": "$4$"
+        }
+      ],
+      "has_image": false
+    },
+    {
+      "number": 7,
+      "stem": "The sequence $u_n$ is defined by $u_1 = 2$ and $u_{n+1} = \\frac{u_n}{1 + u_n}$ for $n \\ge 1$.\n\nWhat is the value of $u_{10}$?",
+      "options": [
+        {
+          "label": "A",
+          "content": "$\\frac{2}{19}$"
+        },
+        {
+          "label": "B",
+          "content": "$\\frac{1}{10}$"
+        },
+        {
+          "label": "C",
+          "content": "$\\frac{2}{21}$"
+        },
+        {
+          "label": "D",
+          "content": "$2^{-10}$"
+        },
+        {
+          "label": "E",
+          "content": "$\\frac{1}{2^9}$"
+        }
+      ],
+      "has_image": false
+    },
+    {
+      "number": 8,
+      "stem": "The table shows some values of the function $f$.\n\nWhich one of the following could be $f(x)$?",
+      "options": [
+        {
+          "label": "A",
+          "content": "$2x + 1$"
+        },
+        {
+          "label": "B",
+          "content": "$x^2 + 1$"
+        },
+        {
+          "label": "C",
+          "content": "$3^x$"
+        },
+        {
+          "label": "D",
+          "content": "$\\sqrt{x + 1}$"
+        },
+        {
+          "label": "E",
+          "content": "$\\frac{6}{x + 1}$"
+        }
+      ],
+      "has_image": true
+    }
+  ]
+}

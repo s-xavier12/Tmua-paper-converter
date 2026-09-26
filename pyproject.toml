@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tmua-paper-converter"
 version = "0.1.0"
-description = "Convert exam paper PDFs into .tmua.json files for a TMUA exam simulator, with multi-pass visual cross-checking."
+description = "Convert exam paper PDFs (and scans/photos) into .tmua.json files for a TMUA exam simulator - offline, no AI."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=1.8",
     "pymupdf>=1.24",
     "pillow>=10",
     "pydantic>=2.6",
@@ -19,8 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Headless-browser rendering of each converted question (KaTeX) so the
-# verifier can compare what the simulator will show against the PDF.
+# Headless-browser KaTeX check: every converted expression must render.
 render = ["playwright>=1.44"]
 dev = ["pytest>=8", "playwright>=1.44", "httpx>=0.27"]
 

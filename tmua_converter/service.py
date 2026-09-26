@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 from .combine import combine_papers
-from .llm import AnthropicTransport, ClaudeRunner
 from .naming import paper_filename
+from .ocr import images_to_pdf, is_image_file
 from .pdf import PdfDocument
 from .pipeline import ConversionResult, ConvertOptions, Converter
 from .schema import Paper, load_paper_dict, write_paper
@@ -21,12 +21,25 @@ class BatchResult:
     results: list[ConversionResult] = field(default_factory=list)
     combined_path: Path | None = None
     combined_report: ValidationReport | None = None
-    failures: list[tuple[str, str]] = field(default_factory=list)  # (pdf name, error)
+    failures: list[tuple[str, str]] = field(default_factory=list)  # (input name, error)
 
 
-def make_runner(options: ConvertOptions, api_key: str | None = None, transport=None) -> ClaudeRunner:
-    transport = transport or AnthropicTransport(api_key=api_key)
-    return ClaudeRunner(transport, model=options.model, effort=options.effort)
+def group_inputs(paths: list[Path], images_are_one_paper: bool, work_dir: Path) -> list[Path]:
+    """Each PDF is a paper; pictures are one paper each, or together the pages of one paper."""
+    images = [p for p in paths if is_image_file(p)]
+    if images_are_one_paper and len(images) > 1:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        merged = images_to_pdf(images, work_dir / f"{images[0].stem}_pages.source.pdf")
+        out, done = [], False
+        for p in paths:
+            if is_image_file(p):
+                if not done:
+                    out.append(merged)
+                    done = True
+            else:
+                out.append(p)
+        return out
+    return list(paths)
 
 
 def report_path_for(out_path: Path) -> Path:
@@ -37,14 +50,14 @@ def report_path_for(out_path: Path) -> Path:
 
 
 def write_report(result: ConversionResult) -> Path:
-    """Sidecar with the validation report, review reasons and correction history."""
+    """Sidecar with the validation report, review reasons and check history."""
     data = result.summary()
     data["metadata_evidence"] = result.metadata
     data["questions_detail"] = {
         str(n): {"sourcePage": s.source_page, "needsReview": s.needs_review, "reviewReasons": s.review_reasons,
                  "history": s.history, "regions": [[p, b.to_list()] for p, b in s.regions],
-                 "figures": [{"page": f.spec.page, "box_pt": f.crop.box_pt.to_list(), "confirmed": f.confirmed,
-                              "notes": f.notes + f.crop.notes} for f in s.figures]}
+                 "figures": [{"page": f.crop.page, "box_pt": f.crop.box_pt.to_list(), "notes": f.crop.notes}
+                             for f in s.figures]}
         for n, s in sorted(result.questions.items())
     }
     path = report_path_for(result.output_path)
@@ -52,25 +65,26 @@ def write_report(result: ConversionResult) -> Path:
     return path
 
 
-def convert_batch(pdfs: list[Path], out_dir: Path, options: ConvertOptions, runner: ClaudeRunner,
-                  combine_title: str | None = None, progress: Callable[[str, str], None] | None = None,
+def convert_batch(inputs: list[Path], out_dir: Path, options: ConvertOptions, combine_title: str | None = None,
+                  progress: Callable[[str, str], None] | None = None,
                   per_paper_options: list[ConvertOptions] | None = None) -> BatchResult:
-    """Convert each PDF to its own file; optionally combine them in the given order."""
+    """Convert each input to its own file; optionally combine them in the given order."""
     progress = progress or (lambda stage, msg: None)
     out_dir.mkdir(parents=True, exist_ok=True)
     batch = BatchResult()
-    for i, pdf in enumerate(pdfs):
-        opts = per_paper_options[i] if per_paper_options else options
-        progress("paper", f"Paper {i + 1}/{len(pdfs)}: {pdf.name}")
+    used: set[str] = set()
+    for i, path in enumerate(inputs):
+        opts = per_paper_options[i] if per_paper_options and i < len(per_paper_options) else options
+        opts = replace(opts, avoid_names=frozenset(used))
+        progress("paper", f"Paper {i + 1}/{len(inputs)}: {path.name}")
         try:
-            res = Converter(runner, opts, progress).convert(pdf, out_dir)
+            res = Converter(opts, progress).convert(path, out_dir)
         except Exception as exc:  # noqa: BLE001 - reported per paper
-            if type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError"):
-                raise
-            batch.failures.append((pdf.name, f"{type(exc).__name__}: {exc}"))
-            progress("error", f"{pdf.name} failed: {exc}")
+            batch.failures.append((path.name, f"{exc}"))
+            progress("error", f"{path.name} failed: {exc}")
             continue
         write_report(res)
+        used.add(res.output_path.name)
         batch.results.append(res)
     if combine_title and batch.results and not batch.failures:
         batch.combined_path, batch.combined_report = combine_results(batch.results, combine_title, out_dir)

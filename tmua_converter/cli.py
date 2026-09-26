@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
-from .llm import SUPPORTED_MODELS
+from .ocr import IMAGE_SUFFIXES
 from .pipeline import ConversionResult, ConvertOptions
-from .service import combine_results, convert_batch, make_runner, report_path_for, revalidate_file
-
-EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+from .service import combine_results, convert_batch, group_inputs, report_path_for, revalidate_file
 
 
 def _summary_lines(res: ConversionResult) -> list[str]:
@@ -20,10 +17,10 @@ def _summary_lines(res: ConversionResult) -> list[str]:
     s = res.summary()
     lines = [f"Conversion completed: {res.output_path}",
              f"  Questions: {len(p.questions)}   Duration: {p.durationMinutes} minutes"]
-    checks = "pass 1 transcription, pass 2 independent verification"
-    checks += " (with KaTeX render comparison)" if res.render_check_used else ""
-    checks += ", pass 3 re-check of the written file"
-    lines.append(f"  Every question visually cross-checked against the PDF pages: {checks}")
+    checks = "rebuilt from the page layout, cross-checked character by character against the PDF"
+    if res.render_check_used:
+        checks += ", every expression rendered with KaTeX"
+    lines.append(f"  Every question checked: {checks}")
     lines.append(f"  Final file reloaded with a JSON parser and validated: {len(res.report.errors)} errors, "
                  f"{len(res.report.warnings)} warnings")
     imgs = s["questions_with_images"]
@@ -40,70 +37,64 @@ def _summary_lines(res: ConversionResult) -> list[str]:
             lines.append(f"  [{issue.level}] {where}: {issue.message}")
     for note in res.notes:
         lines.append(f"  Note: {note}")
-    cost = res.usage.get("estimated_cost_usd")
-    lines.append(f"  API usage: {res.usage['requests']} requests"
-                 + (f", about ${cost:.2f}" if cost is not None else ""))
     lines.append(f"  Report: {report_path_for(res.output_path)}")
     return lines
 
 
 def convert_main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="tmua-convert",
-                                 description="Convert exam paper PDFs into .tmua.json files (one per PDF).")
-    ap.add_argument("pdfs", nargs="+", type=Path, help="PDF files, in order")
-    ap.add_argument("-o", "--out-dir", type=Path, default=None, help="output folder (default: next to each PDF)")
+    ap = argparse.ArgumentParser(
+        prog="tmua-convert",
+        description="Convert exam papers (PDFs, scans or photos) into .tmua.json files - one per paper. "
+                    "Runs entirely on your computer: no AI, no account, no cost.")
+    ap.add_argument("inputs", nargs="+", type=Path,
+                    help=f"PDF files or pictures ({', '.join(sorted(IMAGE_SUFFIXES))}), in order")
+    ap.add_argument("-o", "--out-dir", type=Path, default=None, help="output folder (default: next to each input)")
+    ap.add_argument("--pages", action="store_true",
+                    help="the pictures given are the pages of ONE paper, in order (default: one paper per picture)")
     ap.add_argument("--combine", metavar="TITLE", help="also combine all papers, in the given order, into one file "
                                                        "with this exact title")
-    ap.add_argument("--model", default=os.environ.get("TMUA_MODEL", "claude-opus-5"),
-                    help=f"Claude model (default claude-opus-5; tested choices: {', '.join(SUPPORTED_MODELS)})")
-    ap.add_argument("--effort", choices=EFFORTS, default=os.environ.get("TMUA_EFFORT", "high"))
-    ap.add_argument("--concurrency", type=int, default=4, help="parallel Claude requests (default 4)")
-    ap.add_argument("--no-render-check", action="store_true", help="skip the headless KaTeX render comparison")
-    ap.add_argument("--title", help="override the paper title (single PDF only)")
-    ap.add_argument("--paper", help="override the 'paper' field, e.g. 'Paper 1' (single PDF only)")
-    ap.add_argument("--year", help="override the 'year' field (single PDF only)")
-    ap.add_argument("--duration", type=int, help="override durationMinutes (single PDF only)")
-    ap.add_argument("--questions", type=int, help="expected number of questions (single PDF only)")
-    ap.add_argument("--filename", help="output file name (single PDF only)")
+    ap.add_argument("--no-render-check", action="store_true", help="skip the headless KaTeX render check")
+    ap.add_argument("--title", help="override the paper title (single paper only)")
+    ap.add_argument("--paper", help="override the 'paper' field, e.g. 'Paper 1' (single paper only)")
+    ap.add_argument("--year", help="override the 'year' field (single paper only)")
+    ap.add_argument("--duration", type=int, help="override durationMinutes (single paper only)")
+    ap.add_argument("--questions", type=int, help="expected number of questions (single paper only)")
+    ap.add_argument("--filename", help="output file name (single paper only)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
-                        format="%(levelname)s %(message)s")
-    for pdf in args.pdfs:
-        if not pdf.is_file():
-            ap.error(f"{pdf} not found")
-    single = len(args.pdfs) == 1
-    if not single and any([args.title, args.paper, args.year, args.duration, args.questions, args.filename]):
-        ap.error("--title/--paper/--year/--duration/--questions/--filename apply to a single PDF")
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
+    for path in args.inputs:
+        if not path.is_file():
+            ap.error(f"{path} not found")
+    out_root = args.out_dir or args.inputs[0].parent
+    inputs = group_inputs(args.inputs, args.pages, out_root)
+    if len(inputs) > 1 and any([args.title, args.paper, args.year, args.duration, args.questions, args.filename]):
+        ap.error("--title/--paper/--year/--duration/--questions/--filename apply to a single paper")
 
-    opts = ConvertOptions(model=args.model, effort=args.effort, concurrency=args.concurrency,
-                          render_check=not args.no_render_check, title=args.title, paper=args.paper, year=args.year,
-                          duration_minutes=args.duration, expected_questions=args.questions,
-                          filename=args.filename)
+    opts = ConvertOptions(render_check=not args.no_render_check, title=args.title, paper=args.paper, year=args.year,
+                          duration_minutes=args.duration, expected_questions=args.questions, filename=args.filename)
 
     def progress(stage: str, msg: str) -> None:
         print(f"  [{stage}] {msg}", file=sys.stderr, flush=True)
 
-    runner = make_runner(opts)
     status = 0
-    # Each PDF goes next to itself unless an output folder is given.
-    groups = [(args.out_dir, args.pdfs)] if args.out_dir else [(p.parent, [p]) for p in args.pdfs]
-    all_results = []
-    for out_dir, pdfs in groups:
-        batch = convert_batch(pdfs, out_dir, opts, runner, combine_title=None, progress=progress)
-        all_results.extend(batch.results)
+    groups = [(args.out_dir, inputs)] if args.out_dir else [(p.parent, [p]) for p in inputs]
+    results = []
+    for out_dir, items in groups:
+        batch = convert_batch(items, out_dir, opts, progress=progress)
+        results.extend(batch.results)
         for name, err in batch.failures:
             print(f"FAILED: {name}: {err}", file=sys.stderr)
             status = 1
-    for res in all_results:
+    for res in results:
         print("\n".join(_summary_lines(res)))
         print()
         if not res.report.ok:
             status = 1
-    if args.combine and all_results and status == 0:
-        out, report = combine_results(all_results, args.combine, args.out_dir or args.pdfs[0].parent)
-        n = sum(len(r.paper.questions) for r in all_results)
+    if args.combine and results and status == 0:
+        out, report = combine_results(results, args.combine, out_root)
+        n = sum(len(r.paper.questions) for r in results)
         print(f"Combined file: {out} ({n} questions, in the order given) - reloaded and validated: "
               f"{len(report.errors)} errors, {len(report.warnings)} warnings")
         if not report.ok:

@@ -1,102 +1,70 @@
-"""The conversion pipeline.
+"""Deterministic PDF -> .tmua.json conversion (no AI, no network).
 
-    metadata  ->  pass 1: transcribe each page (Claude, with zoom + crop tools)
-              ->  crop every figure from the PDF and have Claude check each crop
-              ->  pass 2: independent verification of every question against the
-                  source (and against a KaTeX render of the JSON), repeated until
-                  a fresh check finds nothing to correct
-              ->  write the file, reload it with a JSON parser, validate it
-              ->  pass 3: re-check every question *from the reloaded file*
-              ->  write, reload and validate again: that report is the one shown.
+For each question the converter:
+
+1. finds the question's area of the page from its printed question number,
+2. crops every diagram / graph / table from the rendered page,
+3. rebuilds the stem and options (text + LaTeX) from the characters and
+   lines the PDF stores (see :mod:`tmua_converter.mathlayout`),
+4. cross-checks the result against the PDF's own text layer: every letter and
+   digit on the page must appear in the output, and nothing extra,
+5. writes the file, reloads it with a JSON parser and validates it (plus a
+   KaTeX render of every expression when a headless browser is available).
+
+Anything uncertain is flagged ``needsReview`` with the reason.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
-from . import prompts
-from .figures import CropResult, crop_figure, overlay_box
-from .llm import ClaudeRunner, SubmitRejected, Task, TaskFailed, Tool, ToolResult, image_block, text_block
+from . import mathlayout as ml
+from .figures import CropResult, crop_figure
 from .naming import paper_filename, paper_id
+from .ocr import images_to_pdf, is_image_file
 from .pdf import Box, PdfDocument
 from .render import QuestionRenderer, try_start_renderer
 from .schema import Image, Option, Paper, Question, load_paper_dict, write_paper
-from .validator import ValidationReport, check_string, validate_paper
+from .validator import ValidationReport, validate_paper
 
 log = logging.getLogger(__name__)
 
 Progress = Callable[[str, str], None]
 
-FIGURE_KINDS = ["diagram", "graph", "answer_options_panel", "table", "other"]
-
-_BOX_PROPS = {k: {"type": "number"} for k in ("x0", "y0", "x1", "y1")}
-FIGURE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "page": {"type": "integer", "description": "PDF page number the figure is printed on"},
-        **_BOX_PROPS,
-        "kind": {"type": "string", "enum": FIGURE_KINDS},
-        "alt": {"type": "string", "description": "Factual description of what the figure shows (no answers)"},
-    },
-    "required": ["page", "x0", "y0", "x1", "y1", "kind", "alt"],
-    "additionalProperties": False,
-}
-OPTION_SCHEMA = {
-    "type": "object",
-    "properties": {"label": {"type": "string"}, "content": {"type": "string"}},
-    "required": ["label", "content"],
-    "additionalProperties": False,
-}
-REGION_SCHEMA = {
-    "type": "object",
-    "description": "Vertical extent of the whole question (number to last option) in page-image pixels. If it "
-                   "continues onto the next page, continuation_y1 is where it ends on that page, else 0.",
-    "properties": {"y0": {"type": "number"}, "y1": {"type": "number"},
-                   "continues_on_next_page": {"type": "boolean"}, "continuation_y1": {"type": "number"}},
-    "required": ["y0", "y1", "continues_on_next_page", "continuation_y1"],
-    "additionalProperties": False,
-}
+NUMBER_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+    "seventeen eighteen nineteen twenty".split())}
+NUMBER_WORDS.update({"thirty": 30, "forty": 40, "fifty": 50, "twenty-five": 25, "thirty-five": 35})
+LABELS = "ABCDEFGH"
 
 
-# ----------------------------------------------------------------------------- data
+class ConversionError(RuntimeError):
+    pass
+
+
 @dataclass
 class ConvertOptions:
-    model: str = "claude-opus-5"
-    effort: str = "high"
-    concurrency: int = 4
     render_check: bool = True
-    max_verify_rounds: int = 3
-    max_pass3_rounds: int = 2
-    max_figure_attempts: int = 3
     title: str | None = None
     paper: str | None = None
     year: str | None = None
     duration_minutes: int | None = None
     expected_questions: int | None = None
     filename: str | None = None
-
-
-@dataclass
-class FigureSpec:
-    page: int
-    box_pt: Box
-    kind: str
-    alt: str
-    exact: bool = False
+    avoid_names: frozenset = frozenset()  # file names already produced in this batch
 
 
 @dataclass
 class FinalFigure:
-    spec: FigureSpec
     crop: CropResult
     alt: str
-    confirmed: bool
-    notes: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -105,7 +73,6 @@ class QuestionState:
     stem: str
     options: list[dict]
     source_page: int
-    figure_specs: list[FigureSpec] = field(default_factory=list)
     figures: list[FinalFigure] = field(default_factory=list)
     regions: list[tuple[int, Box]] = field(default_factory=list)
     needs_review: bool = False
@@ -118,14 +85,10 @@ class QuestionState:
             self.review_reasons.append(reason)
 
     def to_question(self) -> Question:
-        return Question(
-            number=self.number,
-            stem=self.stem,
-            options=[Option(label=o["label"], content=o["content"]) for o in self.options],
-            images=[Image(src=f.crop.data_uri, alt=f.alt) for f in self.figures],
-            sourcePage=self.source_page,
-            needsReview=self.needs_review,
-        )
+        return Question(number=self.number, stem=self.stem,
+                        options=[Option(label=o["label"], content=o["content"]) for o in self.options],
+                        images=[Image(src=f.crop.data_uri, alt=f.alt) for f in self.figures],
+                        sourcePage=self.source_page, needsReview=self.needs_review)
 
 
 @dataclass
@@ -135,9 +98,9 @@ class ConversionResult:
     report: ValidationReport
     metadata: dict
     questions: dict[int, QuestionState]
-    usage: dict
     render_check_used: bool
     notes: list[str]
+    source_pdf: Path | None = None
 
     def summary(self) -> dict:
         return {
@@ -149,16 +112,97 @@ class ConversionResult:
             "needs_review": {n: s.review_reasons for n, s in sorted(self.questions.items()) if s.needs_review},
             "validation": self.report.to_dict(),
             "render_check_used": self.render_check_used,
-            "usage": self.usage,
             "notes": self.notes,
         }
 
 
+# ----------------------------------------------------------------------------- metadata
+def _words_to_int(w: str) -> int | None:
+    w = w.lower()
+    if w.isdigit():
+        return int(w)
+    return NUMBER_WORDS.get(w)
+
+
+def parse_duration(text: str) -> tuple[int | None, str]:
+    t = re.sub(r"\s+", " ", text)
+    m = re.search(r"\b(\d+|one|two|three)\s*(?:hours?|hrs?)\s*(?:and\s*)?(\d+)\s*(?:minutes|mins?)\b", t, re.I)
+    if m:
+        return _words_to_int(m.group(1)) * 60 + int(m.group(2)), m.group(0)
+    m = re.search(r"\b(\d+)\s*(?:minutes|mins?)\b", t, re.I)
+    if m:
+        return int(m.group(1)), m.group(0)
+    m = re.search(r"\b(\d+(?:\.\d+)?|one|two|three)\s*(?:hours?|hrs?)\b", t, re.I)
+    if m:
+        v = m.group(1)
+        hours = float(v) if v[0].isdigit() else _words_to_int(v)
+        return int(round(hours * 60)), m.group(0)
+    return None, ""
+
+
+def parse_question_count(text: str) -> tuple[int | None, str]:
+    t = re.sub(r"\s+", " ", text)
+    for m in re.finditer(r"\b(\d{1,2}|[a-z]+(?:-[a-z]+)?)\s+(?:multiple[- ]choice\s+)?questions\b", t, re.I):
+        n = _words_to_int(m.group(1))
+        if n:
+            return n, m.group(0)
+    return None, ""
+
+
+def read_metadata(doc: PdfDocument, filename: str) -> dict:
+    first = "\n".join(doc.text(p) for p in range(1, min(doc.page_count, 2) + 1))
+    lines = [ln for ln in doc.content_lines(1) if len(ln.text) > 1]
+    title = ""
+    if lines:
+        biggest = max(ln.size for ln in lines)
+        top = [ln.text.strip() for ln in lines if ln.size >= 0.8 * biggest][:3]
+        title = re.sub(r"\s+", " ", " ".join(top)).strip()
+    stem = re.sub(r"^\d{2}_", "", Path(filename).stem.replace(".source", ""))  # web uploads are numbered 01_, 02_
+    stem = stem.replace("_", " ").replace("-", " ")
+    ocr_cover = doc.is_ocr(1)
+    if not title or len(title) > 120 or (ocr_cover and len(re.findall(r"[A-Za-z]{3,}", title)) < 2):
+        title = stem
+    paper_m = re.search(r"\bPaper\s*(\d+|[IVX]+)\b", first + " " + stem, re.I)
+    year_m = re.search(r"\b(19[89]\d|20\d\d)\b", first) or re.search(r"\b(19[89]\d|20\d\d)\b", stem)
+    set_m = re.search(r"\b((?:Set|Mock|Practice)\s*\d+|Specimen)\b", first + " " + stem, re.I)
+    duration, dur_ev = parse_duration(first)
+    count, count_ev = parse_question_count(first)
+    return {
+        "title": title,
+        "paper": f"Paper {paper_m.group(1)}" if paper_m else "",
+        "year": year_m.group(1) if year_m else (set_m.group(1) if set_m else ""),
+        "duration_minutes": duration or 0,
+        "duration_evidence": dur_ev,
+        "stated_question_count": count or 0,
+        "count_evidence": count_ev,
+    }
+
+
+# ----------------------------------------------------------------------------- helpers
+def _alnum(text: str) -> Counter:
+    """Letters and digits a reader would see, from LaTeX-in-text or plain text."""
+    t = text
+    for sym, cmd in ml.GREEK.items():
+        t = re.sub(re.escape(cmd) + r"(?![A-Za-z])", sym, t)
+    t = re.sub(r"\\mathbb\{[A-Z]\}", " ", t)
+    t = re.sub(r"\\(?!(?:" + "|".join(ml.FUNCTIONS) + r")(?![A-Za-z]))[A-Za-z]+", " ", t)  # drop other commands
+    t = re.sub(r"\\([A-Za-z]+)", r"\1", t)  # \log -> log
+    t = unicodedata.normalize("NFKC", t)
+    return Counter(c for c in t if c.isalnum())
+
+
+def _xextent(items: list[ml.Item]) -> tuple[float, float]:
+    return min(i.x0 for i in items), max(i.x1 for i in items)
+
+
+def _inside(g: ml.Item, box: Box) -> bool:
+    return box.x0 <= g.cx <= box.x1 and box.y0 <= g.cy <= box.y1
+
+
 # ----------------------------------------------------------------------------- converter
 class Converter:
-    def __init__(self, runner: ClaudeRunner, options: ConvertOptions | None = None,
-                 progress: Progress | None = None, renderer: QuestionRenderer | None = None):
-        self.runner = runner
+    def __init__(self, options: ConvertOptions | None = None, progress: Progress | None = None,
+                 renderer: QuestionRenderer | None = None):
         self.opt = options or ConvertOptions()
         self._progress = progress or (lambda stage, msg: None)
         self._renderer = renderer
@@ -171,19 +215,23 @@ class Converter:
     # ======================================================================= entry point
     def convert(self, pdf_path: str | Path, out_dir: str | Path | None = None) -> ConversionResult:
         pdf_path = Path(pdf_path)
+        if is_image_file(pdf_path):  # a photo/screenshot: make it a one-page PDF first
+            target = Path(out_dir) if out_dir else pdf_path.parent
+            target.mkdir(parents=True, exist_ok=True)
+            pdf_path = images_to_pdf([pdf_path], target / (pdf_path.stem + ".source.pdf"))
+        self.source_pdf = pdf_path
         self.doc = PdfDocument(pdf_path)
         self.notes: list[str] = []
+        self._glyph_cache: dict[int, list[ml.Glyph]] = {}
+        self._ignored: set[int] = set()
+        self._ocr_rules: dict[int, list[ml.Rule]] = {}
         try:
             if self._renderer is None and self.opt.render_check:
-                self.progress("setup", "Starting headless KaTeX renderer")
                 self._renderer = try_start_renderer()
                 self._own_renderer = self._renderer is not None
                 if self._renderer is None:
-                    self.notes.append("Rendered-preview check unavailable (install playwright + Chromium to "
-                                      "enable it); verification compared LaTeX source with the page images.")
-            with ThreadPoolExecutor(max_workers=max(1, self.opt.concurrency)) as pool:
-                self.pool = pool
-                return self._convert(pdf_path, Path(out_dir) if out_dir else pdf_path.parent)
+                    self.notes.append("KaTeX render check skipped (install playwright + Chromium to enable it).")
+            return self._convert(pdf_path, Path(out_dir) if out_dir else pdf_path.parent)
         finally:
             if self._own_renderer and self._renderer is not None:
                 self._renderer.close()
@@ -192,189 +240,77 @@ class Converter:
 
     def _convert(self, pdf_path: Path, out_dir: Path) -> ConversionResult:
         doc = self.doc
-        self.progress("metadata", f"Reading cover page of {pdf_path.name} ({doc.page_count} pages)")
-        meta = self._metadata(pdf_path.name)
+        if not doc.has_text_layer():
+            from .ocr import INSTALL_HELP
 
-        # ---------------------------------------------------------------- pass 1
-        pages = [p for p in range(1, doc.page_count + 1) if not doc.is_blank_page(p)]
-        self.progress("pass1", f"Pass 1: transcribing {len(pages)} pages")
-        drafts: dict[int, QuestionState] = {}
-        results = self._map(lambda p: (p, self._transcribe_page(p)), pages, "pass1", "page")
-        for p, qs in sorted(results, key=lambda r: r[0]):
-            for q in qs:
-                self._merge_draft(drafts, q)
-
-        expected = self.opt.expected_questions or meta.get("stated_question_count") or None
-        drafts = self._recover_missing(drafts, expected)
-        if not drafts:
-            raise TaskFailed("no questions were found in the PDF")
+            if doc.ocr_missing_pages:
+                raise ConversionError(f"{pdf_path.name} is a picture (scan/photo), so its text has to be read with "
+                                      f"OCR.\n{INSTALL_HELP}")
+            raise ConversionError(f"No text could be read from {pdf_path.name}.")
+        if doc.ocr_missing_pages:
+            self.notes.append("Some pages contain pictures of text that were not read because Tesseract OCR is not "
+                              "installed; those pictures were kept as images.")
+        if doc.ocr_areas:
+            self.notes.append("Text on page(s) " + ", ".join(map(str, sorted(doc.ocr_areas))) + " was read from "
+                              "pictures with OCR; those questions are marked for review.")
+        self.progress("metadata", f"Reading the cover of {pdf_path.name} ({doc.page_count} pages)")
+        meta = read_metadata(doc, pdf_path.name)
         anchors = doc.find_question_anchors()
-        for n, q in drafts.items():
-            if n in anchors and anchors[n].page != q.source_page:
-                q.history.append(f"sourcePage {q.source_page} -> {anchors[n].page} (question number printed there)")
-                q.source_page = anchors[n].page
-            anchor_regions = doc.question_regions(n)
-            if anchor_regions:
-                q.regions = anchor_regions
+        if not anchors:
+            raise ConversionError("No question numbers were found in the left margin, so the questions could not "
+                                  "be located.")
+        expected = self.opt.expected_questions or meta.get("stated_question_count") or None
+        self.progress("pass1", f"Found {len(anchors)} questions; rebuilding text and maths from the page layout")
 
-        # ---------------------------------------------------------------- figures
-        self._crop_all_figures(drafts)
+        questions: dict[int, QuestionState] = {}
+        for n in sorted(anchors):
+            q = questions[n] = self._question(n)
+            self.progress("pass1", f"Question {n}: {len(q.options)} options, {len(q.figures)} image(s)"
+                          + (" - flagged for review" if q.needs_review else ""))
+        if expected and expected != len(anchors):
+            self.notes.append(f"The paper says it has {expected} questions but {len(anchors)} question numbers "
+                              "were found.")
 
-        # ---------------------------------------------------------------- pass 2
-        self._verify_rounds(drafts, "Pass 2", self.opt.max_verify_rounds, final_round_flags=True)
+        # ------------------------------------------------------------ pass 2: cross-check vs the PDF text layer
+        self.progress("pass2", "Cross-checking every question against the characters printed in the PDF")
+        for q in questions.values():
+            self._cross_check(q)
 
-        # ---------------------------------------------------------------- write, reload, validate, pass 3
+        # ------------------------------------------------------------ pass 3: write, reload, validate
         title, paper_name, year, duration = self._final_metadata(meta)
         name = self.opt.filename or paper_filename(title, paper_name)
+        k = 2
+        base = name[: -len(".tmua.json")] if name.endswith(".tmua.json") else name
+        while name in self.opt.avoid_names:
+            name = f"{base}_{k}.tmua.json"
+            k += 1
         out_path = out_dir / name
-        build = lambda: Paper(id=paper_id(title, paper_name), title=title, paper=paper_name, year=year,  # noqa: E731
-                              durationMinutes=duration,
-                              questions=[drafts[n].to_question() for n in sorted(drafts)])
+
+        def build() -> Paper:
+            return Paper(id=paper_id(title, paper_name), title=title, paper=paper_name, year=year,
+                         durationMinutes=duration, questions=[questions[n].to_question() for n in sorted(questions)])
+
         write_paper(build(), out_path)
-        self.progress("pass3", f"Wrote {out_path.name}; reloading it with a JSON parser")
-
-        pass3_targets: list[int] = []
-        for rnd in range(1, self.opt.max_pass3_rounds + 1):
-            data = load_paper_dict(out_path)
-            report = self._validate(data, expected, meta)
-            targets = sorted(drafts) if rnd == 1 else pass3_targets
-            self.progress("pass3", f"Pass 3 (round {rnd}): re-checking {len(targets)} questions from the "
-                                   "reloaded file")
-            changed = self._pass3(drafts, data, report, targets, rnd)
-            if not changed:
-                break
-            pass3_targets = changed
-            write_paper(build(), out_path)
-        else:
-            for n in pass3_targets:
-                drafts[n].flag("final-file check still found differences after corrections")
-
-        # Anything the validator still rejects is flagged for manual review.
-        data = load_paper_dict(out_path)
-        report = self._validate(data, expected, meta)
+        self.progress("pass3", f"Wrote {out_path.name}; reloading it with a JSON parser and validating")
+        report = self._validate(load_paper_dict(out_path), expected, meta)
         for issue in report.errors:
-            if issue.question in drafts:
-                drafts[issue.question].flag(f"validator: {issue.message}")
+            if issue.question in questions:
+                questions[issue.question].flag(f"validator: {issue.message}")
         write_paper(build(), out_path)
-
-        # The delivered file: reload and validate once more.
         data = load_paper_dict(out_path)
         report = self._validate(data, expected, meta)
         paper = Paper.model_validate(data)
-        self.progress("done", f"Finished: {len(paper.questions)} questions, "
-                              f"{len(report.errors)} validation errors, "
-                              f"{sum(q.needsReview for q in paper.questions)} flagged for review")
-        return ConversionResult(paper=paper, output_path=out_path, report=report, metadata=meta, questions=drafts,
-                                usage=self.runner.usage.to_dict(self.runner.model),
-                                render_check_used=self._renderer is not None, notes=self.notes)
-
-    # ======================================================================= helpers
-    def _map(self, fn: Callable[[Any], Any], items: list, stage: str, noun: str) -> list:
-        """Run *fn* over items on the pool, reporting progress; failures are logged and skipped."""
-        futures = [(item, self.pool.submit(fn, item)) for item in items]
-        out = []
-        for i, (item, fut) in enumerate(futures, start=1):
-            try:
-                out.append(fut.result())
-            except TaskFailed as exc:
-                self.notes.append(str(exc))
-                log.error("%s", exc)
-            self.progress(stage, f"{noun} {i}/{len(items)} done")
-        return out
-
-    def _page_image(self, page: int):
-        return self.doc.render_model_page(page)
-
-    # -- tools ---------------------------------------------------------------
-    def _box_from_input(self, inp: dict) -> tuple[int, Box]:
-        page = int(inp["page"])
-        if not 1 <= page <= self.doc.page_count:
-            raise ValueError(f"page must be between 1 and {self.doc.page_count}")
-        box = Box(float(inp["x0"]), float(inp["y0"]), float(inp["x1"]), float(inp["y1"]))
-        w, h = self.doc.model_image_size(page)
-        box = box.clamp(Box(0, 0, w, h))
-        if box.width < 6 or box.height < 6:
-            raise ValueError("region is empty or too small (coordinates are page-image pixels: x0 < x1, y0 < y1)")
-        return page, box
-
-    def _view_region_tool(self) -> Tool:
-        def handler(inp: dict) -> ToolResult:
-            page, box = self._box_from_input(inp)
-            img = self.doc.render_region_for_model(page, self.doc.px_to_pt(page, box), max_zoom=10.0)
-            scale = img.width / box.width
-            return ToolResult([text_block(f"Page {page}, region {box.to_list(0)} px, shown at {scale:.1f}x the "
-                                          "page-image scale."), image_block(img)])
-
-        return Tool(
-            name="view_region",
-            description="Zoom into a rectangular region of a PDF page at high resolution. Use it whenever small "
-                        "details matter: exponents, subscripts, limits, fraction bars, roots, inequality signs, "
-                        "labels. Coordinates are page-image pixels [x0, y0, x1, y1].",
-            input_schema={"type": "object", "properties": {"page": {"type": "integer"}, **_BOX_PROPS},
-                          "required": ["page", "x0", "y0", "x1", "y1"], "additionalProperties": False},
-            handler=handler,
-        )
-
-    def _preview_crop_tool(self) -> Tool:
-        def handler(inp: dict) -> ToolResult:
-            page, box = self._box_from_input(inp)
-            crop = crop_figure(self.doc, page, self.doc.px_to_pt(page, box), refine=not inp.get("exact", False))
-            final_px = self.doc.pt_to_px(page, crop.box_pt)
-            info = (f"Crop of page {page}. Requested {box.to_list(0)} px; final crop {final_px.to_list(0)} px "
-                    f"after automatic tightening; image {crop.image.width}x{crop.image.height} px.\n"
-                    f"Adjustments: {'; '.join(crop.notes) or 'none'}\nMetrics: {crop.metrics}")
-            return ToolResult([text_block(info), image_block(crop.image)])
-
-        return Tool(
-            name="preview_figure_crop",
-            description="Preview exactly how a figure will be cropped from the PDF. The box is automatically "
-                        "snapped to the drawing, extended to include its labels and trimmed of whitespace; set "
-                        "exact=true to use your box as given (only trimmed). Use it to confirm the crop contains "
-                        "the whole figure and nothing else.",
-            input_schema={"type": "object",
-                          "properties": {"page": {"type": "integer"}, **_BOX_PROPS, "exact": {"type": "boolean"}},
-                          "required": ["page", "x0", "y0", "x1", "y1", "exact"], "additionalProperties": False},
-            handler=handler,
-        )
-
-    # -- metadata --------------------------------------------------------------
-    def _metadata(self, filename: str) -> dict:
-        doc = self.doc
-        pages = [p for p in range(1, min(doc.page_count, 2) + 1)]
-        content: list[dict] = []
-        for p in pages:
-            w, h = doc.model_image_size(p)
-            content += [text_block(f"PDF page {p} ({w}x{h} px):"), image_block(self._page_image(p))]
-        text_hint = "\n".join(f"--- page {p} ---\n{doc.text(p)[:3000]}" for p in range(1, min(doc.page_count, 3) + 1))
-        content.append(text_block(prompts.METADATA_TASK.format(filename=filename)
-                                  + (f"\nText layer of the first pages (hint only):\n{text_hint}" if text_hint.strip()
-                                     else "")))
-
-        def validate(inp: dict) -> dict:
-            if not str(inp.get("title", "")).strip():
-                raise SubmitRejected("title must not be empty")
-            if int(inp.get("duration_minutes", 0)) < 0 or int(inp.get("stated_question_count", 0)) < 0:
-                raise SubmitRejected("numbers must not be negative")
-            return dict(inp)
-
-        schema = {"type": "object", "properties": {
-            "title": {"type": "string"}, "paper": {"type": "string"}, "year": {"type": "string"},
-            "duration_minutes": {"type": "integer"}, "duration_evidence": {"type": "string"},
-            "stated_question_count": {"type": "integer"}, "count_evidence": {"type": "string"}},
-            "required": ["title", "paper", "year", "duration_minutes", "duration_evidence",
-                         "stated_question_count", "count_evidence"], "additionalProperties": False}
-        task = Task(name="metadata", system=prompts.SYSTEM_PROMPT, content=content, tools=[self._view_region_tool()],
-                    submit=Tool("submit_metadata", "Submit the paper's metadata.", schema, validate=validate),
-                    max_turns=8)
-        meta = self.runner.run(task)
-        self.progress("metadata", f"Title: {meta['title']!r}; duration: {meta['duration_minutes'] or 'not stated'}; "
-                                  f"stated questions: {meta['stated_question_count'] or 'not stated'}")
-        return meta
+        flagged = sum(q.needsReview for q in paper.questions)
+        self.progress("done", f"Finished: {len(paper.questions)} questions, {len(report.errors)} validation errors, "
+                              f"{flagged} flagged for review")
+        return ConversionResult(paper=paper, output_path=out_path, report=report, metadata=meta, questions=questions,
+                                render_check_used=self._renderer is not None, notes=self.notes,
+                                source_pdf=self.source_pdf)
 
     def _final_metadata(self, meta: dict) -> tuple[str, str, str, int]:
-        title = self.opt.title or meta["title"].strip()
-        paper_name = self.opt.paper if self.opt.paper is not None else meta.get("paper", "").strip()
-        year = self.opt.year or meta.get("year", "").strip() or "Unknown"
+        title = self.opt.title or meta["title"]
+        paper_name = self.opt.paper if self.opt.paper is not None else meta.get("paper", "")
+        year = self.opt.year or meta.get("year") or "Unknown"
         duration = self.opt.duration_minutes or int(meta.get("duration_minutes") or 0)
         if not duration:
             duration = 75
@@ -385,487 +321,286 @@ class Converter:
             self.notes.append("The PDF does not name the paper, so the 'paper' field was set to 'Paper 1'.")
         return title, paper_name, year, duration
 
-    # -- pass 1 ----------------------------------------------------------------
-    def _transcribe_page(self, page: int, only_question: int | None = None) -> list[QuestionState]:
+    # ======================================================================= one question
+    def _glyphs(self, page: int) -> list[ml.Glyph]:
+        if page not in self._glyph_cache:
+            raw = self.doc.rawdict(page)
+            with self.doc._lock:
+                glyphs = ml.page_glyphs(self.doc._page(page), page, raw=raw)
+            furniture = [ln.box for ln in self.doc.lines(page) if self.doc.is_furniture(ln, page)]
+            glyphs = [g for g in glyphs if not any(_inside(g, f.expand(1)) for f in furniture)]
+            dash_rules, glyphs = ml.ocr_dash_rules(glyphs)
+            self._ocr_rules[page] = dash_rules
+            self._glyph_cache[page] = glyphs
+        return self._glyph_cache[page]
+
+    def _rules(self, page: int) -> list[ml.Rule]:
+        self._glyphs(page)
+        with self.doc._lock:
+            return ml.page_rules(self.doc._page(page)) + self._ocr_rules.get(page, [])
+
+    def _is_anchor_glyph(self, g: ml.Glyph, n: int) -> bool:
+        a = self.doc.find_question_anchors()[n]
+        return g.page == a.page and a.box.expand(0.5).contains(Box(g.x0, g.y0, g.x1, g.y1), tol=0.5)
+
+    def _question(self, n: int) -> QuestionState:
         doc = self.doc
-        nxt = page + 1 if page < doc.page_count and not doc.is_blank_page(page + 1) else None
-        size = doc.model_image_size(page)
-        content: list[dict] = [text_block(f"Image 1 - PDF page {page}:"), image_block(self._page_image(page))]
-        next_size = None
-        if nxt is not None:
-            next_size = doc.model_image_size(nxt)
-            content += [text_block(f"Image 2 - PDF page {nxt} (continuations only):"), image_block(self._page_image(nxt))]
-        anchors = [a for a in doc.find_question_anchors().values() if a.page == page]
-        marker_hint = ""
-        if anchors:
-            z = doc.model_zoom(page)
-            marker_hint = ("\nQuestion numbers detected in the PDF text layer on this page (may be incomplete): "
-                           + ", ".join(f"{a.number} at y≈{a.box.y0 * z:.0f}px" for a in anchors) + "\n")
-        page_text = doc.text(page).strip()
-        text_hint = (f"\nPDF text layer for page {page} (hint only - maths in it is often scrambled):\n<text_layer>\n"
-                     f"{page_text[:6000]}\n</text_layer>\n") if page_text else ""
-        extra = ""
-        if only_question is not None:
-            extra = (f"\nNote: question {only_question} was not found in an earlier pass although it should start on "
-                     f"this page. Submit ONLY question {only_question} (or an empty list if it is really not here).\n")
-        content.append(text_block(prompts.PAGE_TASK.format(
-            page=page, page_count=doc.page_count, next_page=nxt or "(none)",
-            image_list=prompts.page_image_list(page, size, nxt, next_size),
-            marker_hint=marker_hint, text_hint=text_hint, extra=extra)))
+        anchor = doc.find_question_anchors()[n]
+        regions = doc.question_regions(n)
+        q = QuestionState(number=n, stem="", options=[], source_page=anchor.page, regions=regions)
+        problems: list[str] = []
+        glyphs: list[ml.Glyph] = []
+        rules: list[ml.Rule] = []
+        for page, box in regions:
+            page_g = [g for g in self._glyphs(page) if _inside(g, box) and not self._is_anchor_glyph(g, n)]
+            page_r = [r for r in self._rules(page) if box.x0 - 1 <= r.x0 and r.x1 <= box.x1 + 1
+                      and box.y0 <= r.y <= box.y1]
+            S = ml.body_size(page_g) if page_g else 10.0
+            for crop in self._figures(page, box, S):
+                inside = [g for g in page_g if _inside(g, crop.box_pt)]
+                labels = [g.ch for g in sorted(inside, key=lambda g: (round(g.base / 4), g.x0))
+                          if g.ch in LABELS and (g.bold or g.ocr) and not g.math_font]
+                ids = {id(g) for g in inside}
+                page_g = [g for g in page_g if id(g) not in ids]
+                page_r = [r for r in page_r if not (crop.box_pt.x0 - 1 <= r.x0 and r.x1 <= crop.box_pt.x1 + 1
+                                                    and crop.box_pt.y0 - 1 <= r.y <= crop.box_pt.y1 + 1)]
+                q.figures.append(FinalFigure(crop, "", labels))
+                if crop.metrics.get("edges_cutting_ink"):
+                    q.flag(f"figure on page {page} may be cut off ({', '.join(crop.metrics['edges_cutting_ink'])})")
+            glyphs += page_g
+            rules += page_r
 
-        attempts = {"n": 0}
-        allowed_pages = {page} | ({nxt} if nxt else set())
+        if not glyphs:
+            q.flag("no text found for this question")
+            return q
+        if any(g.ocr for g in glyphs):
+            q.flag("read from a picture with OCR: free OCR is unreliable for maths symbols, so check the maths "
+                   "against the picture")
+        S = ml.body_size(glyphs)
+        items = ml.Builder(glyphs, rules, problems).build()
+        page_of = {}
+        for it in items:
+            gs = it.glyphs()
+            page_of[id(it)] = gs[0].page if gs else anchor.page
+        lines = ml.build_lines(items, page_of, S)
+        col = (min(ln.x0 for ln in lines), max(ln.x1 for ln in lines))
 
-        def validate(inp: dict) -> list[QuestionState]:
-            attempts["n"] += 1
-            problems: list[str] = []
-            out: list[QuestionState] = []
-            seen: set[int] = set()
-            for i, q in enumerate(inp.get("questions", [])):
-                num = q.get("number")
-                where = f"question {num}"
-                if not isinstance(num, int) or num < 1:
-                    problems.append(f"questions[{i}]: number must be a positive integer")
+        # ---------------------------------------------------------------- option labels A, B, C, ...
+        segments: dict[str | None, list[ml.Line]] = {None: []}
+        found: list[str] = []
+        current: str | None = None
+        label_col: float | None = None  # x of the "A" label; OCR may glue later labels to their text
+        for ln in lines:
+            its = sorted(ln.items, key=lambda i: i.x0)
+            cur: list[ml.Item] = []
+            for k, it in enumerate(its):
+                want = LABELS[len(found)] if len(found) < len(LABELS) else None
+                nxt = its[k + 1] if k + 1 < len(its) else None
+                prv = its[k - 1] if k else None
+                spaced = (nxt is None or nxt.x0 - it.x1 >= 0.45 * S) and (prv is None or it.x0 - prv.x1 >= 1.0 * S)
+                ocr_column = isinstance(it, ml.Glyph) and it.ocr and label_col is not None and k == 0 \
+                    and abs(it.x0 - label_col) < 0.3 * S
+                if want and isinstance(it, ml.Glyph) and it.ch == want and not it.math_font and (spaced or ocr_column):
+                    if want == "A":
+                        label_col = it.x0
+                    if cur:
+                        segments[current].append(_subline(cur, ln))
+                    cur = []
+                    current = want
+                    found.append(want)
+                    segments[current] = []
                     continue
-                if num in seen:
-                    problems.append(f"{where}: submitted twice")
-                seen.add(num)
-                if only_question is not None and num != only_question:
-                    problems.append(f"{where}: only question {only_question} was requested")
-                problems += _content_problems(where, q.get("stem"), q.get("options"))
-                specs = []
-                for j, f in enumerate(q.get("figures", [])):
-                    try:
-                        fp, fbox = self._box_from_input(f)
-                    except (ValueError, KeyError, TypeError) as exc:
-                        problems.append(f"{where} figure {j + 1}: {exc}")
-                        continue
-                    if fp not in allowed_pages:
-                        problems.append(f"{where} figure {j + 1}: page must be one of {sorted(allowed_pages)}")
-                        continue
-                    specs.append(FigureSpec(fp, doc.px_to_pt(fp, fbox), f.get("kind", "diagram"),
-                                            f.get("alt", "").strip()))
-                st = QuestionState(number=num, stem=q["stem"], options=[dict(o) for o in q["options"]],
-                                   source_page=page, figure_specs=specs, regions=self._regions_from(page, nxt, q))
-                if q.get("needs_review"):
-                    st.flag(f"pass 1: {q.get('review_note') or 'flagged by transcriber'}")
-                out.append(st)
-            if problems and attempts["n"] < 3:
-                raise SubmitRejected("\n".join(problems))
-            for p in problems:  # accepted on the last attempt: carry the problems as review flags
-                num = _leading_number(p)
-                for st in out:
-                    if st.number == num:
-                        st.flag(f"pass 1 submission problem: {p}")
-            return out
+                cur.append(it)
+            if cur:
+                segments[current].append(_subline(cur, ln))
 
-        schema = {"type": "object", "properties": {
-            "questions": {"type": "array", "items": {"type": "object", "properties": {
-                "number": {"type": "integer"},
-                "stem": {"type": "string"},
-                "options": {"type": "array", "items": OPTION_SCHEMA},
-                "figures": {"type": "array", "items": FIGURE_SCHEMA},
-                "region": REGION_SCHEMA,
-                "needs_review": {"type": "boolean"},
-                "review_note": {"type": "string"}},
-                "required": ["number", "stem", "options", "figures", "region", "needs_review", "review_note"],
-                "additionalProperties": False}},
-            "page_note": {"type": "string"}},
-            "required": ["questions", "page_note"], "additionalProperties": False}
-        task = Task(name=f"pass1-page{page}", system=prompts.SYSTEM_PROMPT, content=content,
-                    tools=[self._view_region_tool(), self._preview_crop_tool()],
-                    submit=Tool("submit_page", "Submit the transcription of every question whose number is printed "
-                                               "on this page (empty list if none).", schema, validate=validate),
-                    max_turns=40)
-        return self.runner.run(task)
+        if any(g.ocr for g in glyphs):
+            rows = self._ocr_label_rows(regions, lines, S, label_col)
+            if len(rows) > len(found):
+                found, segments = self._segments_from_rows(rows, lines, S)
+                q.history.append(f"answer labels located from the picture ({len(rows)} rows)")
 
-    def _regions_from(self, page: int, nxt: int | None, q: dict) -> list[tuple[int, Box]]:
-        r = q.get("region") or {}
-        try:
-            w, h = self.doc.model_image_size(page)
-            y0, y1 = max(0.0, float(r["y0"])), min(float(h), float(r["y1"]))
-            regions = []
-            if y1 - y0 > 10:
-                regions.append((page, self.doc.px_to_pt(page, Box(0, y0, w, y1))))
-            if r.get("continues_on_next_page") and nxt is not None and float(r.get("continuation_y1", 0)) > 10:
-                w2, h2 = self.doc.model_image_size(nxt)
-                regions.append((nxt, self.doc.px_to_pt(nxt, Box(0, 0, w2, min(float(h2), float(r["continuation_y1"]))))))
-            return regions
-        except (KeyError, TypeError, ValueError):
-            return []
+        # the last option ends at a big vertical gap (e.g. "END OF TEST" below it)
+        if found:
+            kept: list[ml.Line] = []
+            lines_last = segments[found[-1]]
+            for k, ln in enumerate(lines_last):
+                if kept and (ln.page != kept[-1].page or ln.y0 - kept[-1].y1 > 2.5 * S):
+                    dropped = lines_last[k:]
+                    self._ignored.update(id(g) for d in dropped for it in d.items for g in it.glyphs())
+                    q.history.append("ignored text printed below the last option: "
+                                     + " / ".join(ml.lines_to_text([d], []) for d in dropped)[:80])
+                    break
+                kept.append(ln)
+            segments[found[-1]] = kept
 
-    def _merge_draft(self, drafts: dict[int, QuestionState], q: QuestionState) -> None:
-        existing = drafts.get(q.number)
-        if existing is None:
-            drafts[q.number] = q
-            return
-        anchors = self.doc.find_question_anchors()
-        anchor_page = anchors[q.number].page if q.number in anchors else None
-        keep, drop = existing, q
-        if anchor_page is not None and q.source_page == anchor_page and existing.source_page != anchor_page:
-            keep, drop = q, existing
-        elif anchor_page is None and q.source_page < existing.source_page:
-            keep, drop = q, existing
-        keep.history.append(f"also transcribed from page {drop.source_page}; kept the page {keep.source_page} version")
-        drafts[q.number] = keep
-
-    def _recover_missing(self, drafts: dict[int, QuestionState], expected: int | None) -> dict[int, QuestionState]:
-        anchors = self.doc.find_question_anchors()
-        top = max([expected or 0, len(anchors), *drafts.keys()] or [0])
-        missing = [n for n in range(1, top + 1) if n not in drafts]
-        if not missing:
-            return drafts
-        self.progress("pass1", f"Questions {missing} missing after pass 1 - re-reading their pages")
-        jobs = []
-        for n in missing:
-            if n in anchors:
-                page = anchors[n].page
+        q.stem = ml.lines_to_text(segments[None], problems, column=col)
+        opts = [{"label": lab, "content": _numeric_as_maths(ml.lines_to_text(segments[lab], problems))}
+                for lab in found]
+        if len(opts) < 2:
+            seq: list[str] = []
+            fig_labels = [lab for f in q.figures for lab in f.labels]
+            for lab in fig_labels:
+                if len(seq) < len(LABELS) and lab == LABELS[len(seq)]:
+                    seq.append(lab)
+            if any(g.ocr for g in glyphs) and "A" in fig_labels and len(set(fig_labels)) >= 2:
+                # OCR can miss a letter or two in a graph panel; the panel runs A, B, C, ... in order
+                seq = list(LABELS[:LABELS.index(max(set(fig_labels) & set(LABELS))) + 1])
+            if len(seq) >= 2:
+                opts = [{"label": lab, "content": f"Graph {lab}"} for lab in seq]
+                q.history.append("the options are the labelled graphs in the figure")
             else:
-                before = [drafts[k].source_page for k in drafts if k < n]
-                after = [drafts[k].source_page for k in drafts if k > n]
-                lo = max(before) if before else 1
-                hi = min(after) if after else self.doc.page_count
-                page = next((p for p in range(lo, hi + 1) if not self.doc.is_blank_page(p)), lo)
-            jobs.append((n, page))
-        results = self._map(lambda job: self._transcribe_page(job[1], only_question=job[0]), jobs, "pass1",
-                            "missing question")
-        for qs in results:
-            for q in qs:
-                q.history.append("recovered in a targeted re-read of its page")
-                self._merge_draft(drafts, q)
-        return dict(sorted(drafts.items()))
+                q.flag("could not find the answer options A, B, C, ... - add them by hand")
+        q.options = opts
 
-    # -- figures ---------------------------------------------------------------
-    def _crop_all_figures(self, drafts: dict[int, QuestionState]) -> None:
-        jobs = [(q, spec) for q in drafts.values() for spec in q.figure_specs]
-        if not jobs:
-            self.progress("figures", "No figures to crop")
-            return
-        self.progress("figures", f"Cropping and checking {len(jobs)} figures")
-        results = self._map(lambda job: (job[0].number, job[1], self._finalize_figure(job[0], job[1])), jobs,
-                            "figures", "figure")
-        by_q: dict[int, list[FinalFigure]] = {}
-        for num, spec, fig in results:
-            by_q.setdefault(num, []).append(fig)
-        for q in drafts.values():
-            figs = by_q.get(q.number, [])
-            order = {id(s): i for i, s in enumerate(q.figure_specs)}
-            q.figures = sorted(figs, key=lambda f: order.get(id(f.spec), 0))
-            for f in q.figures:
-                if not f.confirmed:
-                    q.flag(f"image crop could not be confirmed: {'; '.join(f.notes) or 'see crop'}")
-            if len(q.figures) < len(q.figure_specs):
-                q.flag("a figure could not be cropped")
+        for f in q.figures:
+            f.alt = _alt_text(q, f)
+        for p in dict.fromkeys(problems):
+            q.flag(p)
+        if not q.stem:
+            q.flag("the question text came out empty")
+        for o in q.options:
+            if not o["content"].strip():
+                q.flag(f"option {o['label']} came out empty")
+        pages = ", ".join(str(p) for p, _ in regions)
+        q.history.append(f"pass 1: rebuilt from {len(glyphs)} characters and {sum(r.used for r in rules)} "
+                         f"fraction/root bars on page(s) {pages}")
+        return q
 
-    def _finalize_figure(self, q: QuestionState, spec: FigureSpec, context: str = "") -> FinalFigure:
-        doc = self.doc
-        current = spec
-        notes: list[str] = []
-        crop = None
-        alt = spec.alt
-        for attempt in range(1, self.opt.max_figure_attempts + 1):
-            crop = crop_figure(doc, current.page, current.box_pt, refine=not current.exact)
-            verdict = self._check_figure(q, current, crop, alt, context)
-            alt = verdict["alt"].strip() or alt
-            if verdict["ok"]:
-                return FinalFigure(current, crop, alt, True, notes)
-            notes.append(f"attempt {attempt}: {', '.join(verdict['problems']) or 'problem'} - {verdict['note']}")
-            cb = verdict["corrected_box"]
-            page, box_px = self._box_from_input(cb)
-            new = FigureSpec(page, doc.px_to_pt(page, box_px), current.kind, alt, bool(cb.get("exact")))
-            if new.page == current.page and _same_box(new.box_pt, current.box_pt) and new.exact == current.exact:
-                break
-            current = new
-        # last candidate after the final correction, unconfirmed
-        crop = crop_figure(doc, current.page, current.box_pt, refine=not current.exact)
-        return FinalFigure(current, crop, alt, False, notes)
+    def _ocr_label_rows(self, regions, lines, S: float, label_col: float | None) -> list[tuple[int, Box]]:
+        """Answer labels in a picture, found from the ink: a letter-sized mark in the label column
+        with clear space after it, below the question text.  Works even when OCR misreads the letter."""
+        if label_col is None:
+            cands = [it for ln in lines for it in ln.items
+                     if isinstance(it, ml.Glyph) and it.ocr and it.ch in LABELS]
+            xs = sorted(round(g.x0) for g in cands)
+            best = max(xs, key=lambda x: sum(abs(x - o) < 3 for o in xs), default=None)
+            if best is None or sum(abs(best - o) < 3 for o in xs) < 2:
+                return []
+            label_col = best
+        rows: list[tuple[int, Box]] = []
+        for page, box in regions:
+            strip = Box(label_col - 0.4 * S, box.y0, label_col + 1.6 * S, box.y1).clamp(box)
+            wide = Box(label_col - 0.4 * S, box.y0, min(box.x1, label_col + 3.0 * S), box.y1).clamp(box)
+            blobs = self.doc.ink_components(page, wide, [])
+            for b in blobs:
+                if not (abs(b.x0 - label_col) < 0.35 * S and 0.4 * S <= b.height <= 1.4 * S
+                        and 0.3 * S <= b.width <= 1.3 * S and strip.contains(b, tol=1)):
+                    continue
+                gap_ok = not any(o is not b and o.x0 < b.x1 + 0.45 * S and o.x1 > b.x1 and
+                                 min(o.y1, b.y1) - max(o.y0, b.y0) > 0.3 * b.height for o in blobs)
+                if gap_ok:
+                    rows.append((page, b))
+        rows.sort(key=lambda r: (r[0], r[1].y0))
+        return rows[:len(LABELS)]
 
-    def _check_figure(self, q: QuestionState, spec: FigureSpec, crop: CropResult, alt: str, context: str) -> dict:
-        doc = self.doc
-        page_img = self._page_image(spec.page)
-        box_px = doc.pt_to_px(spec.page, crop.box_pt)
-        content = [
-            text_block(f"Image 1 - PDF page {spec.page} with the crop outlined in red (crop box {box_px.to_list(0)} "
-                       "px):"),
-            image_block(overlay_box(page_img, box_px)),
-            text_block("Image 2 - the cropped image:"),
-            image_block(crop.image),
-            text_block(prompts.FIGURE_TASK.format(
-                page=spec.page, number=q.number, width=crop.image.width, height=crop.image.height, stem=q.stem,
-                kind=spec.kind, alt=alt or "(none)",
-                metrics=(f"Automatic crop measurements: {crop.metrics}. Adjustments made: "
-                         f"{'; '.join(crop.notes) or 'none'}." + (f"\nReviewer comment: {context}" if context else "")))),
-        ]
-        problems_enum = ["wrong_figure", "cut_off", "too_much_whitespace", "includes_extra_text", "unreadable"]
-        schema = {"type": "object", "properties": {
-            "ok": {"type": "boolean"},
-            "problems": {"type": "array", "items": {"type": "string", "enum": problems_enum}},
-            "corrected_box": {"type": "object", "properties": {"page": {"type": "integer"}, **_BOX_PROPS,
-                                                               "exact": {"type": "boolean"}},
-                              "required": ["page", "x0", "y0", "x1", "y1", "exact"], "additionalProperties": False,
-                              "description": "Better box in page-image pixels (repeat the current box if ok)."},
-            "alt": {"type": "string"},
-            "note": {"type": "string"}},
-            "required": ["ok", "problems", "corrected_box", "alt", "note"], "additionalProperties": False}
+    def _segments_from_rows(self, rows, lines, S):
+        """Split lines into stem and options by the vertical position of the label rows."""
+        found = [LABELS[i] for i in range(len(rows))]
+        segments: dict[str | None, list[ml.Line]] = {None: []}
+        for lab in found:
+            segments[lab] = []
 
-        def validate(inp: dict) -> dict:
-            if len(inp.get("alt", "").strip()) < 8:
-                raise SubmitRejected("alt must describe the figure (at least a short sentence)")
-            try:
-                self._box_from_input(inp["corrected_box"])
-            except (ValueError, KeyError, TypeError) as exc:
-                raise SubmitRejected(f"corrected_box: {exc}") from exc
-            return dict(inp)
+        def owner(page: int, y: float) -> str | None:
+            label = None
+            for i, (p, b) in enumerate(rows):
+                if (p, b.y0 - 0.35 * S) <= (page, y):
+                    label = found[i]
+            return label
 
-        task = Task(name=f"figure-q{q.number}", system=prompts.SYSTEM_PROMPT, content=content,
-                    tools=[self._view_region_tool(), self._preview_crop_tool()],
-                    submit=Tool("submit_figure_check", "Submit the verdict on the crop.", schema, validate=validate),
-                    max_turns=16)
-        return self.runner.run(task)
+        for ln in lines:
+            keep = [it for it in ln.items
+                    if not any(p == ln.page and b.expand(1.0).x0 <= it.cx <= b.expand(1.0).x1
+                               and b.expand(1.0).y0 <= it.cy <= b.expand(1.0).y1 for p, b in rows)]
+            by_label: dict[str | None, list[ml.Item]] = {}
+            for it in keep:
+                by_label.setdefault(owner(ln.page, it.cy), []).append(it)
+            for lab, its in by_label.items():
+                segments[lab].append(_subline(its, ln))
+        return found, segments
 
-    # -- verification (pass 2 and pass 3) ----------------------------------------
-    def _render(self, qdict: dict) -> tuple[bytes | None, dict[str, str]]:
-        if self._renderer is None:
-            return None, {}
-        try:
-            r = self._renderer.render(qdict)
-            return r.png, r.katex_errors
-        except Exception as exc:  # noqa: BLE001
-            log.warning("render failed for question %s: %s", qdict.get("number"), exc)
-            return None, {}
+    def _figures(self, page: int, region: Box, S: float) -> list[CropResult]:
+        """Crops for diagrams/graphs/tables inside a question's region."""
+        ocr = self.doc.is_ocr(page, region)
+        min_size, join_gap = (3.0 * S, 4.0 * S) if ocr else (1.6 * S, 2.5 * S)
+        boxes = [g.clamp(region) for g in self.doc.graphic_boxes(page)
+                 if region.overlap_fraction(g) > 0.5 and g.width >= min_size and g.height >= min_size]
+        merged = [b for b in boxes if not b.is_empty()]
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(merged)):
+                for j in range(i + 1, len(merged)):
+                    if merged[i].gap_to(merged[j]) < join_gap:
+                        merged[i] = merged[i].union(merged.pop(j))
+                        changed = True
+                        break
+                if changed:
+                    break
+        merged.sort(key=lambda b: (b.y0, b.x0))
+        return [crop_figure(self.doc, page, b.expand(1.0)) for b in merged]
 
-    def _verify(self, q: QuestionState, qdict: dict, pass_name: str, render_png: bytes | None,
-                issues: list[str]) -> dict:
-        doc = self.doc
-        content: list[dict] = []
-        supplied: list[str] = []
-        idx = 0
-
-        def add(label: str, img) -> None:
-            nonlocal idx
-            idx += 1
-            supplied.append(f"- Image {idx}: {label}")
-            content.extend([text_block(f"Image {idx} - {label}:"), image_block(img)])
-
+    # ======================================================================= checks
+    def _cross_check(self, q: QuestionState) -> None:
+        """Every letter/digit printed in the question must be in the output, and nothing extra."""
+        expected: Counter = Counter()
         for page, box in q.regions:
-            add(f"zoomed crop of question {q.number} from PDF page {page} (the source)",
-                doc.render_region_for_model(page, box))
-        for page in sorted({p for p, _ in q.regions} | {q.source_page}):
-            add(f"full PDF page {page} for context (page-image coordinates for view_region)", self._page_image(page))
-        if render_png is not None:
-            add("how the current transcription renders in the simulator (KaTeX)", render_png)
-        for i, img in enumerate(qdict.get("images", [])):
-            fig = q.figures[i] if i < len(q.figures) else None
-            if fig is not None:
-                add(f"attached figure {i + 1} (cropped from page {fig.spec.page}; alt: {img['alt']})", fig.crop.image)
-
-        options_text = "\n".join(f"{o['label']}: {o['content']}" for o in qdict["options"])
-        issue_text = ("\nAutomated checks reported these problems, which must be fixed:\n- " + "\n- ".join(issues)
-                      + "\n") if issues else ""
-        if q.review_reasons:
-            issue_text += ("\nEarlier notes on this question (check whether they still apply):\n- "
-                           + "\n- ".join(q.review_reasons) + "\n")
-        figures_text = f"Attached figures: {len(qdict.get('images', []))}\n"
-        render_hint = ("\nThe KaTeX render shows exactly what the student will see: compare it against the source "
-                       "crop for grouping (fractions, roots, exponents, brackets).") if render_png is not None else ""
-        content.append(text_block(prompts.VERIFY_TASK.format(
-            pass_name=pass_name, number=q.number, supplied="\n".join(supplied), stem=qdict["stem"],
-            options=options_text, figures=figures_text, issues=issue_text, render_hint=render_hint)))
-
-        current_options = [dict(o) for o in qdict["options"]]
-        attempts = {"n": 0}
-
-        def validate(inp: dict) -> dict:
-            attempts["n"] += 1
-            problems = _content_problems("", inp.get("stem"), inp.get("options"))
-            for j, f in enumerate(inp.get("missing_figures", [])):
-                try:
-                    self._box_from_input(f)
-                except (ValueError, KeyError, TypeError) as exc:
-                    problems.append(f"missing_figures[{j}]: {exc}")
-            if problems and attempts["n"] < 3:
-                raise SubmitRejected("\n".join(problems))
-            out = dict(inp)
-            out["_problems"] = problems
-            changed = inp["stem"] != qdict["stem"] or [dict(o) for o in inp["options"]] != current_options
-            out["changed"] = changed
-            return out
-
-        schema = {"type": "object", "properties": {
-            "verdict": {"type": "string", "enum": ["match", "corrected"]},
-            "discrepancies": {"type": "array", "items": {"type": "object", "properties": {
-                "where": {"type": "string"}, "source_shows": {"type": "string"}, "transcription_had": {"type": "string"}},
-                "required": ["where", "source_shows", "transcription_had"], "additionalProperties": False}},
-            "stem": {"type": "string"},
-            "options": {"type": "array", "items": OPTION_SCHEMA},
-            "figures_ok": {"type": "boolean"},
-            "figure_problems": {"type": "string"},
-            "missing_figures": {"type": "array", "items": FIGURE_SCHEMA},
-            "needs_review": {"type": "boolean"},
-            "review_note": {"type": "string"}},
-            "required": ["verdict", "discrepancies", "stem", "options", "figures_ok", "figure_problems",
-                         "missing_figures", "needs_review", "review_note"], "additionalProperties": False}
-        task = Task(name=f"{pass_name.lower().replace(' ', '')}-q{q.number}", system=prompts.SYSTEM_PROMPT,
-                    content=content, tools=[self._view_region_tool()],
-                    submit=Tool("submit_verification", "Submit the verification result for this question.", schema,
-                                validate=validate),
-                    max_turns=30)
-        return self.runner.run(task)
-
-    def _apply_verification(self, q: QuestionState, res: dict, label: str) -> bool:
-        """Apply a verifier result; returns True if the question changed (needs another check)."""
-        changed = False
-        if res["changed"]:
-            diffs = "; ".join(f"{d['where']}: '{d['transcription_had']}' -> '{d['source_shows']}'"
-                              for d in res["discrepancies"]) or "text changed"
-            q.history.append(f"{label}: corrected ({diffs})")
-            q.stem = res["stem"]
-            q.options = [dict(o) for o in res["options"]]
-            changed = True
-        elif res["verdict"] == "corrected":
-            q.history.append(f"{label}: reported discrepancies but returned identical text")
+            for g in self._glyphs(page):
+                if not _inside(g, box) or self._is_anchor_glyph(g, q.number) or id(g) in self._ignored:
+                    continue
+                if any(f.crop.page == page and _inside(g, f.crop.box_pt) for f in q.figures):
+                    continue
+                expected.update(c for c in unicodedata.normalize("NFKC", g.ch) if c.isalnum())
+        got = _alnum(q.stem)
+        graph_options = bool(q.options) and all(o["content"] == f"Graph {o['label']}" for o in q.options)
+        if not graph_options:
+            for o in q.options:
+                got += _alnum(o["content"])
+                got[o["label"]] += 1  # the printed label letter itself
+        missing, extra = expected - got, got - expected
+        if missing or extra:
+            detail = []
+            if missing:
+                detail.append("missing " + " ".join(sorted(missing.elements())))
+            if extra:
+                detail.append("extra " + " ".join(sorted(extra.elements())))
+            q.flag("cross-check against the PDF's characters failed (" + "; ".join(detail) + ")")
         else:
-            q.history.append(f"{label}: matches source")
-        for p in res.get("_problems", []):
-            q.flag(f"{label}: {p}")
-        if res["needs_review"]:
-            q.flag(f"{label}: {res['review_note'] or 'flagged by verifier'}")
-        for f in res["missing_figures"]:
-            try:
-                page, box_px = self._box_from_input(f)
-                spec = FigureSpec(page, self.doc.px_to_pt(page, box_px), f["kind"], f["alt"])
-                fig = self._finalize_figure(q, spec)
-            except (ValueError, KeyError, TaskFailed) as exc:
-                q.flag(f"{label}: reported a missing figure that could not be cropped ({exc})")
-                continue
-            q.figure_specs.append(spec)
-            q.figures.append(fig)
-            q.history.append(f"{label}: added missing figure from page {page}")
-            if not fig.confirmed:
-                q.flag("image crop could not be confirmed (added during verification)")
-            changed = True
-        if not res["figures_ok"] and q.figures:
-            q.history.append(f"{label}: figure problem reported - {res['figure_problems']}")
-            try:
-                rechecked = [self._finalize_figure(q, f.spec, context=res["figure_problems"]) for f in q.figures]
-            except TaskFailed as exc:
-                q.flag(f"figure problem could not be re-checked: {res['figure_problems']} ({exc})")
-                return changed
-            if [f.crop.box_pt for f in rechecked] != [f.crop.box_pt for f in q.figures]:
-                changed = True
-            q.figures = rechecked
-            if not all(f.confirmed for f in rechecked):
-                q.flag(f"figure problem: {res['figure_problems']}")
-        return changed
-
-    def _question_dict(self, q: QuestionState) -> dict:
-        return q.to_question().model_dump(mode="json")
-
-    def _verify_rounds(self, drafts: dict[int, QuestionState], pass_name: str, rounds: int,
-                       final_round_flags: bool) -> None:
-        pending = sorted(drafts)
-        for rnd in range(1, rounds + 1):
-            label = f"{pass_name} round {rnd}"
-            self.progress("pass2", f"{label}: verifying {len(pending)} questions against the source")
-            prepared = []
-            for n in pending:  # rendering must stay on this thread (Playwright)
-                qd = self._question_dict(drafts[n])
-                png, kerr = self._render(qd)
-                issues = [f"{fld}: KaTeX cannot render it ({msg})" for fld, msg in kerr.items()]
-                issues += _string_issues(qd)
-                prepared.append((n, qd, png, issues))
-            results = self._map(lambda item: (item[0], self._verify(drafts[item[0]], item[1], label, item[2], item[3])),
-                                prepared, "pass2", "question")
-            done = {n for n, _ in results}
-            for n in pending:
-                if n not in done:
-                    drafts[n].flag(f"{label}: verification failed to run")
-            next_pending = []
-            for n, res in sorted(results, key=lambda r: r[0]):
-                if self._apply_verification(drafts[n], res, label):
-                    next_pending.append(n)
-            pending = next_pending
-            if not pending:
-                return
-        if final_round_flags:
-            for n in pending:
-                drafts[n].flag(f"{pass_name}: still being corrected after {rounds} verification rounds - check "
-                               "the latest corrections by hand")
-
-    def _pass3(self, drafts: dict[int, QuestionState], data: dict, report: ValidationReport, targets: list[int],
-               rnd: int) -> list[int]:
-        """Verify questions as parsed from the written file; returns numbers that changed."""
-        by_num = {q["number"]: q for q in data["questions"]}
-        prepared = []
-        for n in targets:
-            qd = by_num.get(n)
-            if qd is None:
-                continue
-            png, kerr = self._render(qd)
-            issues = [f"{i.field or 'question'}: {i.message}" for i in report.for_question(n) if i.level == "error"]
-            issues += [f"{fld}: KaTeX cannot render it ({msg})" for fld, msg in kerr.items()]
-            prepared.append((n, qd, png, issues))
-        label = f"Pass 3 round {rnd} (final file)"
-        results = self._map(lambda item: (item[0], self._verify(drafts[item[0]], item[1], label, item[2], item[3])),
-                            prepared, "pass3", "question")
-        changed = []
-        for n, res in sorted(results, key=lambda r: r[0]):
-            if self._apply_verification(drafts[n], res, label):
-                changed.append(n)
-        return changed
+            q.history.append("pass 2: every letter and digit printed in the question is in the output exactly once")
 
     def _validate(self, data: dict, expected: int | None, meta: dict) -> ValidationReport:
         katex_errors: dict[tuple[int, str], str] = {}
         if self._renderer is not None:
-            for q in data.get("questions", []):
-                _, kerr = self._render(q)
-                for fld, msg in kerr.items():
-                    katex_errors[(q["number"], fld)] = msg
+            for qd in data.get("questions", []):
+                try:
+                    res = self._renderer.render(qd)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("render failed: %s", exc)
+                    continue
+                for fld, msg in res.katex_errors.items():
+                    katex_errors[(qd["number"], fld)] = msg
         expected_duration = self.opt.duration_minutes or int(meta.get("duration_minutes") or 0) or None
         return validate_paper(data, expected_questions=expected, expected_duration=expected_duration, pdf=self.doc,
                               katex_errors=katex_errors)
 
 
-# ----------------------------------------------------------------------------- module helpers
-def _content_problems(where: str, stem: Any, options: Any) -> list[str]:
-    """Error-level string problems in a submitted stem/options (fed back to Claude)."""
-    prefix = f"{where}: " if where else ""
-    problems = []
-    if not isinstance(options, list) or len(options) < 2:
-        problems.append(f"{prefix}needs at least two options")
-        options = options if isinstance(options, list) else []
-    for i, o in enumerate(options):
-        want = chr(ord("A") + i)
-        if o.get("label") != want:
-            problems.append(f"{prefix}option {i + 1} label must be '{want}' (labels are sequential A, B, C, ...)")
-    r = ValidationReport()
-    check_string(r, stem, None, "stem")
-    for o in options:
-        check_string(r, o.get("content"), None, f"option {o.get('label')}")
-    problems += [f"{prefix}{i.field}: {i.message}" for i in r.errors]
-    return problems
+def _numeric_as_maths(text: str) -> str:
+    """An answer that is just a number is written as maths, like every other expression."""
+    m = re.fullmatch(r"([-−]?)\s*(\d+(?:\.\d+)?)", text.strip())
+    return f"${'-' if m.group(1) else ''}{m.group(2)}$" if m else text
 
 
-def _string_issues(qd: dict) -> list[str]:
-    r = ValidationReport()
-    check_string(r, qd["stem"], qd["number"], "stem")
-    for o in qd["options"]:
-        check_string(r, o["content"], qd["number"], f"option {o['label']}")
-    return [f"{i.field}: {i.message}" for i in r.errors]
+def _subline(items: list[ml.Item], ln: ml.Line) -> ml.Line:
+    x0, x1 = _xextent(items)
+    return ml.Line(items, ln.base, x0, x1, min(i.y0 for i in items), max(i.y1 for i in items), ln.page)
 
 
-def _leading_number(problem: str) -> int | None:
-    m = re.match(r"question (\d+)", problem)
-    return int(m.group(1)) if m else None
+def _alt_text(q: QuestionState, f: FinalFigure) -> str:
+    if len(f.labels) >= 2 and q.options and all(o["content"].startswith("Graph ") for o in q.options):
+        return f"Graphs labelled {', '.join(f.labels)} for question {q.number} (the answer options)"
+    return f"Diagram for question {q.number}, cropped from page {f.crop.page} of the paper"
 
 
-def _same_box(a: Box, b: Box, tol: float = 2.0) -> bool:
-    return all(abs(x - y) <= tol for x, y in zip(a.to_list(3), b.to_list(3)))
-
-
-def convert_pdf(pdf_path: str | Path, runner: ClaudeRunner, options: ConvertOptions | None = None,
-                out_dir: str | Path | None = None, progress: Progress | None = None,
-                renderer: QuestionRenderer | None = None) -> ConversionResult:
-    return Converter(runner, options, progress, renderer).convert(pdf_path, out_dir)
-
-
+def convert_pdf(pdf_path: str | Path, options: ConvertOptions | None = None, out_dir: str | Path | None = None,
+                progress: Progress | None = None, renderer: QuestionRenderer | None = None) -> ConversionResult:
+    return Converter(options, progress, renderer).convert(pdf_path, out_dir)

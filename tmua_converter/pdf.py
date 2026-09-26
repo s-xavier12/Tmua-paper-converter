@@ -25,8 +25,10 @@ from PIL import Image
 MODEL_LONG_EDGE = 2576  # max image long edge used by current Claude vision models
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
+# Fonts LaTeX's picture mode uses to draw slanted lines and circles: graphics, not text.
+_DRAWING_FONT_RE = re.compile(r"^(LINE|LCIRCLE|LCIRCLEW)\d*", re.I)
 _NUMBER_ONLY_RE = re.compile(r"[\-–—\s]*\d{1,3}[\-–—\s]*")
-_BLANK_PAGE_RE = re.compile(r"(blank\s+page|intentionally\s+(left\s+)?blank)", re.I)
+_BLANK_PAGE_RE = re.compile(r"(blank\s*page|intentionally\s*(left\s*)?blank)", re.I)
 
 
 @dataclass(frozen=True)
@@ -113,6 +115,29 @@ class Anchor:
     box: Box
 
 
+def _spaced_text(spans: list[dict]) -> str:
+    """Line text with spaces restored from gaps (many PDFs store no space characters)."""
+    out = ""
+    prev_x1 = None
+    for s in spans:
+        size = float(s.get("size", 10)) or 10
+        for c in s.get("chars", []):
+            ch = clean_text(c["c"])
+            if not ch:
+                continue
+            x0, x1 = c["bbox"][0], c["bbox"][2]
+            if ch.isspace():
+                if out and not out.endswith(" "):
+                    out += " "
+                prev_x1 = x1
+                continue
+            if prev_x1 is not None and x0 - prev_x1 > 0.2 * size and out and not out.endswith(" "):
+                out += " "
+            out += ch
+            prev_x1 = x1
+    return out.strip()
+
+
 def clean_text(s: str) -> str:
     return s.translate(_ZERO_WIDTH)
 
@@ -124,7 +149,13 @@ def png_bytes(img: Image.Image, optimize: bool = True) -> bytes:
 
 
 class PdfDocument:
-    def __init__(self, path: str | Path):
+    """A PDF with a text layer for every page.
+
+    Pages that are pictures (scans, photos) - and pictures pasted into normal
+    pages - are read with free offline OCR (Tesseract) when ``ocr`` is on.
+    """
+
+    def __init__(self, path: str | Path, ocr: bool = True):
         self.path = Path(path)
         self._lock = threading.RLock()
         self._doc = pymupdf.open(str(self.path))
@@ -133,6 +164,12 @@ class PdfDocument:
         self._lines_cache: dict[int, list[TextLine]] = {}
         self._furniture: set[tuple[str, int]] | None = None
         self._anchors: dict[int, Anchor] | None = None
+        self.ocr_enabled = ocr
+        self._pages: dict[int, pymupdf.Page] = {}
+        self._textpages: dict[int, object] = {}
+        self.ocr_areas: dict[int, list[Box]] = {}  # page -> areas whose text came from OCR
+        self.ocr_missing_pages: list[int] = []  # pages that needed OCR but Tesseract is not installed
+        self._ink_cache: dict[tuple[int, tuple], list[Box]] = {}
 
     # ------------------------------------------------------------------ basics
     @property
@@ -152,7 +189,142 @@ class PdfDocument:
     def _page(self, page: int) -> pymupdf.Page:
         if not 1 <= page <= self.page_count:
             raise ValueError(f"page {page} out of range 1..{self.page_count}")
-        return self._doc[page - 1]
+        if page not in self._pages:
+            self._pages[page] = self._doc[page - 1]
+        return self._pages[page]
+
+    # ------------------------------------------------------------------ OCR
+    def textpage(self, page: int):
+        """The text layer to read: native, or OCR for pictures (None = native)."""
+        if page in self._textpages:
+            return self._textpages[page]
+        tp = None
+        with self._lock:
+            pg = self._page(page)
+            native = pg.get_text("text").strip()
+            pr = pg.rect
+            big_images = [Box.of(i["bbox"]) for i in pg.get_image_info()
+                          if (i["bbox"][2] - i["bbox"][0]) > 0.25 * pr.width and
+                          (i["bbox"][3] - i["bbox"][1]) > 0.03 * pr.height]
+            if self.ocr_enabled and (not native or big_images):
+                from .ocr import find_tessdata
+
+                tessdata = find_tessdata()
+                if tessdata is None:
+                    self.ocr_missing_pages.append(page)
+                elif not native:
+                    tp = pg.get_textpage_ocr(dpi=300, full=True, tessdata=tessdata)
+                    self.ocr_areas[page] = [Box(0, 0, pr.width, pr.height)]
+                else:
+                    cand = pg.get_textpage_ocr(dpi=300, full=False, tessdata=tessdata)
+                    words = pg.get_text("words", textpage=cand)
+                    texty = [b for b in big_images
+                             if sum(1 for w in words if b.x0 <= (w[0] + w[2]) / 2 <= b.x1
+                                    and b.y0 <= (w[1] + w[3]) / 2 <= b.y1 and re.search(r"[A-Za-z]{2}", w[4])) >= 4]
+                    if texty:  # a picture of text (e.g. a pasted screenshot of a question)
+                        tp = cand
+                        self.ocr_areas[page] = texty
+        self._textpages[page] = tp
+        return tp
+
+    def is_ocr(self, page: int, box: Box | None = None) -> bool:
+        self.textpage(page)
+        areas = self.ocr_areas.get(page, [])
+        if box is None:
+            return bool(areas)
+        return any(a.overlap_fraction(box) > 0.5 for a in areas)
+
+    def get_text(self, page: int, kind: str = "text", **kw):
+        tp = self.textpage(page)
+        with self._lock:
+            if tp is not None:
+                kw["textpage"] = tp
+            return self._page(page).get_text(kind, **kw)
+
+    def rawdict(self, page: int) -> dict:
+        """Characters of the page: the PDF's own text, plus OCR text inside pictures of text."""
+        tp = self.textpage(page)
+        flags = pymupdf.TEXTFLAGS_TEXT
+        with self._lock:
+            pg = self._page(page)
+            if tp is None:
+                return pg.get_text("rawdict", flags=flags)
+            ocr = pg.get_text("rawdict", flags=flags, textpage=tp)
+            areas = self.ocr_areas.get(page, [])
+            if len(areas) == 1 and areas[0].area >= Box.of(pg.rect).area * 0.99:
+                return ocr  # the whole page is a picture
+            native = pg.get_text("rawdict", flags=flags)
+
+        def inside(line) -> bool:
+            b = Box.of(line["bbox"])
+            cx, cy = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+            return any(a.x0 <= cx <= a.x1 and a.y0 <= cy <= a.y1 for a in areas)
+
+        blocks = []
+        for blk in native.get("blocks", []):
+            lines = [ln for ln in blk.get("lines", []) if not inside(ln)]
+            if lines:
+                blocks.append({**blk, "lines": lines})
+        for blk in ocr.get("blocks", []):
+            lines = [ln for ln in blk.get("lines", []) if inside(ln)]
+            if lines:
+                blocks.append({**blk, "lines": lines})
+        return {"blocks": blocks, "width": native.get("width"), "height": native.get("height")}
+
+    def ink_components(self, page: int, area: Box, exclude: list[Box]) -> list[Box]:
+        """Connected blobs of ink in *area* (pt), ignoring the *exclude* boxes (text).
+
+        Used to find diagrams inside pictures, where there are no vector drawings.
+        """
+        key = (page, tuple(round(v, 1) for v in area.to_list()))
+        if key in self._ink_cache:
+            return self._ink_cache[key]
+        zoom = 2.0
+        cell = 3  # px; cells with any ink are joined into blobs
+        img = self.render(page, zoom, area).convert("L")
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(img)
+        for b in exclude:
+            i = b.intersect(area)
+            if not i.is_empty():
+                draw.rectangle([(i.x0 - area.x0) * zoom - 2, (i.y0 - area.y0) * zoom - 2,
+                                (i.x1 - area.x0) * zoom + 2, (i.y1 - area.y0) * zoom + 2], fill=255)
+        ink = img.point(lambda v: 255 if v < 150 else 0)
+        pad_w, pad_h = (-ink.width) % cell, (-ink.height) % cell
+        if pad_w or pad_h:
+            padded = Image.new("L", (ink.width + pad_w, ink.height + pad_h), 0)
+            padded.paste(ink, (0, 0))
+            ink = padded
+        small = ink.reduce(cell)  # box average: any ink in a cell -> non-zero
+        gw, gh = small.size
+        grid = bytearray(1 if v else 0 for v in small.tobytes())
+        seen = bytearray(gw * gh)
+        boxes: list[Box] = []
+        for start in range(gw * gh):
+            if not grid[start] or seen[start]:
+                continue
+            stack = [start]
+            seen[start] = 1
+            minx = maxx = start % gw
+            miny = maxy = start // gw
+            while stack:
+                c = stack.pop()
+                cx, cy = c % gw, c // gw
+                minx, maxx, miny, maxy = min(minx, cx), max(maxx, cx), min(miny, cy), max(maxy, cy)
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < gw and 0 <= ny < gh:
+                            n = ny * gw + nx
+                            if grid[n] and not seen[n]:
+                                seen[n] = 1
+                                stack.append(n)
+            f = cell / zoom
+            boxes.append(Box(area.x0 + minx * f, area.y0 + miny * f, area.x0 + (maxx + 1) * f,
+                             area.y0 + (maxy + 1) * f))
+        self._ink_cache[key] = boxes
+        return boxes
 
     def page_box(self, page: int) -> Box:
         with self._lock:
@@ -205,14 +377,16 @@ class PdfDocument:
         if page in self._lines_cache:
             return self._lines_cache[page]
         out: list[TextLine] = []
-        with self._lock:
-            data = self._page(page).get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)
+        data = self.rawdict(page)
         for block in data.get("blocks", []):
             for line in block.get("lines", []):
-                spans = [s for s in line.get("spans", []) if clean_text(s.get("text", "")).strip()]
+                spans = [s for s in line.get("spans", []) if not _DRAWING_FONT_RE.match(s.get("font", ""))]
+                for s in spans:
+                    s["text"] = "".join(c["c"] for c in s.get("chars", []))
+                spans = [s for s in spans if clean_text(s["text"]).strip()]
                 if not spans:
                     continue
-                text = clean_text("".join(s["text"] for s in spans)).strip()
+                text = _spaced_text(spans)
                 first = spans[0]
                 font = first.get("font", "")
                 bold = bool(first.get("flags", 0) & 16) or "bold" in font.lower() or "black" in font.lower()
@@ -229,8 +403,10 @@ class PdfDocument:
         return out
 
     def text(self, page: int) -> str:
-        with self._lock:
-            return clean_text(self._page(page).get_text("text"))
+        if self.textpage(page) is None:
+            with self._lock:
+                return clean_text(self._page(page).get_text("text"))
+        return "\n".join(ln.text for ln in self.lines(page))
 
     def has_text_layer(self) -> bool:
         return any(self.lines(p) for p in range(1, self.page_count + 1))
@@ -291,8 +467,30 @@ class PdfDocument:
                 clusters = [d["rect"] for d in pg.get_drawings()]
             for r in clusters:
                 boxes.append(Box.of(r))
+            ocr_areas = self.ocr_areas.get(page, []) if self.textpage(page) is not None else []
             for info in pg.get_image_info():
-                boxes.append(Box.of(info["bbox"]))
+                ib = Box.of(info["bbox"])
+                if not any(a.overlap_fraction(ib) > 0.5 for a in ocr_areas):
+                    boxes.append(ib)  # a picture/diagram (pictures of text are handled below)
+            # line-drawing font glyphs (LaTeX picture mode), merged into clusters
+            pieces = [Box.of(sp["bbox"]) for b in pg.get_text("dict").get("blocks", [])
+                      for ln in b.get("lines", []) for sp in ln.get("spans", [])
+                      if _DRAWING_FONT_RE.match(sp.get("font", ""))]
+            for piece in pieces:
+                for i, other in enumerate(boxes):
+                    if other.gap_to(piece) < 3:
+                        boxes[i] = other.union(piece)
+                        break
+                else:
+                    boxes.append(piece)
+        # inside pictures of text, diagrams are the blobs of ink that are not mostly text
+        if ocr_areas:
+            text_boxes = [ln.box for ln in self.lines(page)]
+            for area in ocr_areas:
+                for blob in self.ink_components(page, area.clamp(pbox), []):
+                    covered = sum(blob.intersect(t).area for t in text_boxes if not blob.intersect(t).is_empty())
+                    if blob.area > 0 and covered / blob.area < 0.5:
+                        boxes.append(blob)
         keep = []
         for b in boxes:
             b = b.clamp(pbox)
@@ -385,7 +583,17 @@ class PdfDocument:
             return Box(left, max(0.0, top), min(pbox.width, content.x1 + 6), min(pbox.height, bottom))
 
         same_page_end = nxt.box.y0 - 6 if nxt is not None and nxt.page == a.page else None
-        first = span(a.page, a.box.y0 - 6, same_page_end)
+        top = a.box.y0 - 6
+        # A picture pasted inline sits on the text baseline, so its question number is printed at
+        # the picture's bottom-left: the question then starts at the top of the picture.
+        prev = anchors.get(number - 1)
+        floor = prev.box.y1 + 2 if prev is not None and prev.page == a.page else 0.0
+        with self._lock:
+            images = [Box.of(i["bbox"]) for i in self._page(a.page).get_image_info()]
+        for img in images:
+            if img.x0 >= a.box.x1 - 2 and img.y0 < a.box.y0 and img.y1 >= a.box.y0 - 2 and img.y0 >= floor:
+                top = min(top, img.y0 - 4)
+        first = span(a.page, top, same_page_end)
         if first is not None:
             regions.append((a.page, first))
         if same_page_end is not None:
