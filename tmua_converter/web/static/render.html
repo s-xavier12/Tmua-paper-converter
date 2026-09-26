@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Question render</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="question.css">
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/auto-render.min.js"></script>
+<script src="question-render.js"></script>
+<style>
+  body { margin: 0; background: #fff; }
+  #q { width: 760px; padding: 18px 22px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="q"></div>
+<script>
+  // Called by tmua_converter.render: returns KaTeX errors keyed by field.
+  window.renderForCheck = function (q) {
+    const errors = {};
+    TMUA.renderQuestionInto(document.getElementById("q"), q, {
+      onError: function (field, msg) { if (!errors[field]) errors[field] = msg; },
+    });
+    const imgs = Array.from(document.querySelectorAll("#q img"));
+    return Promise.all(imgs.map((im) => im.complete ? null : new Promise((r) => { im.onload = im.onerror = r; })))
+      .then(() => document.fonts.ready)
+      .then(() => errors);
+  };
+</script>
+</body>
+</html>

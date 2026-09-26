@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TMUA Paper Converter</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%232458d6%22/%3E%3Ctext x=%2216%22 y=%2223%22 font-size=%2218%22 text-anchor=%22middle%22 fill=%22white%22 font-family=%22serif%22%3E%E2%88%91%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="question.css">
+<link rel="stylesheet" href="style.css">
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/auto-render.min.js"></script>
+<script src="question-render.js"></script>
+</head>
+<body>
+<header class="top">
+  <a href="#/" class="brand">TMUA Paper Converter</a>
+  <span class="tag">PDF → .tmua.json</span>
+</header>
+
+<main id="view"></main>
+
+<template id="tpl-home">
+  <section class="card">
+    <h1>Convert exam papers</h1>
+    <p class="muted">Each PDF becomes its own <code>.tmua.json</code>. Every question is transcribed, independently
+      verified against the page images, written, reloaded and validated. Figures are cropped straight from the PDF.</p>
+    <label class="drop" id="drop">
+      <input type="file" id="pdfs" accept="application/pdf,.pdf" multiple hidden>
+      <strong>Choose PDFs</strong> or drop them here
+    </label>
+    <ol id="file-list" class="file-list"></ol>
+
+    <div class="row">
+      <label class="check"><input type="checkbox" id="combine"> Also combine them into one paper, in this order</label>
+    </div>
+    <div class="row" id="combine-row" hidden>
+      <label>Combined paper title <input type="text" id="combine-title" placeholder="Exact title for the combined paper"></label>
+    </div>
+
+    <details class="settings">
+      <summary>Model settings</summary>
+      <div class="grid2">
+        <label>Model <select id="model"></select></label>
+        <label>Effort
+          <select id="effort">
+            <option value="medium">medium</option>
+            <option value="high" selected>high (default)</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max (slowest, most thorough)</option>
+          </select>
+        </label>
+      </div>
+      <p class="muted small" id="render-note"></p>
+    </details>
+    <div class="row" id="key-row" hidden>
+      <label>Anthropic API key <input type="password" id="api-key" autocomplete="off" placeholder="sk-ant-…"></label>
+      <p class="muted small">Used only for this conversion and never stored. Or set ANTHROPIC_API_KEY before starting the app.</p>
+    </div>
+    <div class="actions">
+      <button id="start" class="primary" disabled>Convert</button>
+      <span id="start-msg" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Review an existing file</h2>
+    <p class="muted">Open a <code>.tmua.json</code> to validate, preview and edit it. Add its PDF to see each question's source.</p>
+    <div class="grid2">
+      <label>.tmua.json <input type="file" id="review-json" accept=".json,application/json"></label>
+      <label>Source PDF (optional) <input type="file" id="review-pdf" accept="application/pdf,.pdf"></label>
+    </div>
+    <div class="actions"><button id="review-open">Open</button> <span id="review-msg" class="muted"></span></div>
+  </section>
+
+  <section class="card" id="recent-card" hidden>
+    <h2>This session</h2>
+    <ul id="recent" class="recent"></ul>
+  </section>
+</template>
+
+<template id="tpl-job">
+  <section class="card">
+    <div class="job-head">
+      <h1 id="job-title">Converting…</h1>
+      <span id="job-status" class="pill"></span>
+    </div>
+    <p class="muted small">Accuracy over speed: each paper takes a while (every page is read, every question is checked
+      at least twice, every figure crop is inspected). You can leave this page open.</p>
+    <div id="results"></div>
+    <details id="log-box" open>
+      <summary>Progress log</summary>
+      <pre id="log" class="log"></pre>
+    </details>
+  </section>
+</template>
+
+<template id="tpl-review">
+  <section class="card">
+    <div class="review-head">
+      <div>
+        <a id="back" class="small">← back</a>
+        <h1 id="rv-file"></h1>
+      </div>
+      <div class="actions">
+        <span id="rv-dirty" class="muted small" hidden>Unsaved changes</span>
+        <button id="rv-save" class="primary">Save &amp; re-validate</button>
+        <a id="rv-download" class="button">Download .tmua.json</a>
+      </div>
+    </div>
+    <div class="grid5" id="rv-meta"></div>
+    <div id="rv-report"></div>
+    <div class="filters">
+      <label class="check"><input type="radio" name="flt" value="all" checked> All</label>
+      <label class="check"><input type="radio" name="flt" value="flagged"> Needs review / issues</label>
+    </div>
+  </section>
+  <div id="rv-questions"></div>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>
