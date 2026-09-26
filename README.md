@@ -48,8 +48,15 @@ The validator checks:
 
 Anything unresolved gets `"needsReview": true`, with the reason in the summary and on the review page.
 
-The tests typeset a sample paper three ways: LaTeX fonts, Times, and Word-style Unicode maths with
-options across the line. Every question comes out **exactly** right in all three.
+The tests use one sample paper made four ways: LaTeX fonts, Times, Unicode maths with options across
+the line, and a real Word `.docx` with Word's own equations exported to PDF. Every question comes out
+**exactly** right in all four.
+
+It never gives up on a whole paper because of one odd question:
+
+- **A question it can't rebuild** keeps its plain text and is flagged.
+- **A paper with no findable question numbers** is split one question per page, and flagged.
+- **Pictures of text** are read with OCR, if Tesseract is installed.
 
 ## Setup
 
@@ -125,7 +132,8 @@ A `.report.json` next to each file has the full details.
 ```bash
 pip install -e ".[dev]"
 python -m pytest
-python tests/make_latex_papers.py    # regenerate the test papers (needs pdflatex + xelatex)
+python tests/make_latex_papers.py    # regenerate the LaTeX test papers (needs pdflatex + xelatex)
+python tests/make_word_paper.py      # regenerate the Word test paper (needs python-docx, latex2mathml, LibreOffice)
 ```
 
 KaTeX 0.16.22 is vendored under `tmua_converter/web/static/vendor/katex` (MIT licence).

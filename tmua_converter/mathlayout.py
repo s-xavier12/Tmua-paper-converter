@@ -112,6 +112,7 @@ class Glyph(Item):
     page: int = 0
     known: bool = True
     ocr: bool = False  # read from a picture by OCR
+    big: bool = False  # a tall bracket (\\left / \\right)
 
     def glyphs(self) -> list["Glyph"]:
         return [self]
@@ -284,6 +285,8 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                     base = float(ch["origin"][1])
                     cmex = "CMEX" in font.upper()
                     y0, y1 = _vertical_extent(c, norm, font, base, size, y0, y1)
+                    if "OpenSymbol" in font and norm in ("¿", "∨") and y1 - y0 > 1.15 * size:
+                        norm = "|"  # LibreOffice's stretched absolute-value bars extract as these
                     if norm in _STRETCHY and math_font and not cmex and "CMSY" not in font.upper():
                         dl = dl or page.get_displaylist()
                         ext = _ink_extent(dl, page.rect, x0, x1, y0, y1, size)
@@ -323,6 +326,37 @@ def ocr_dash_rules(glyphs: list[Glyph]) -> tuple[list[Rule], list[Glyph]]:
         run.append(g)
     flush()
     return rules, [g for g in glyphs if id(g) not in drop]
+
+
+def page_radicals(page) -> tuple[list[Rule], list[Glyph]]:
+    """Root signs drawn as lines (MathType, some word processors): a check mark plus a bar.
+
+    Returned as a bar (Rule) and a synthetic "√" glyph, the same shape TeX produces.
+    """
+    rules: list[Rule] = []
+    signs: list[Glyph] = []
+    for d in page.get_drawings():
+        segs = [(it[1], it[2]) for it in d.get("items", []) if it[0] == "l"]
+        if len(segs) < 2 or len(segs) != len(d.get("items", [])):
+            continue
+        r = d["rect"]
+        if r.height < 4 or r.width < 4:
+            continue
+        horiz = [(a, b) for a, b in segs if abs(a.y - b.y) < 0.4 and abs(a.x - b.x) > 2]
+        if not horiz:
+            continue
+        top = min(horiz, key=lambda ab: ab[0].y)
+        hx0, hx1 = min(top[0].x, top[1].x), max(top[0].x, top[1].x)
+        others = [(a, b) for a, b in segs if (a, b) != top]
+        if abs(top[0].y - r.y0) > 1 or not others or not all(max(a.x, b.x) <= hx0 + 1 for a, b in others):
+            continue
+        if not any(max(a.y, b.y) > r.y1 - 1 for a, b in others):
+            continue  # the check mark must reach down to the bottom of the sign
+        size = r.height
+        rules.append(Rule(hx0, hx1, top[0].y))
+        signs.append(Glyph(r.x0, r.y0, hx0, r.y1, r.y1 - 0.2 * size, size * 0.8, RADICAL, RADICAL, "drawn-radical",
+                           False, False, True))
+    return rules, signs
 
 
 def page_rules(page) -> list[Rule]:
@@ -413,6 +447,9 @@ class Builder:
         self.items.append(new)
 
     def build(self) -> list[Item]:
+        for it in self.items:  # brackets drawn at a larger size than the text around them
+            if isinstance(it, Glyph) and it.ch in "()[]|" and it.y1 - it.y0 > 1.45 * self.S:
+                it.big = True
         self._big_ops()
         for rule in sorted(self.rules, key=lambda r: r.width):
             self._apply_rule(rule)
@@ -472,8 +509,7 @@ class Builder:
                      and it.cy < op.cy - 0.25 * h and it.y1 >= op.y0 - 1.1 * S]
             lower = [it for it in self.items if it is not op and self._in_x(it, op.x0, op.x1, 2) and small(it)
                      and it.cy > op.cy + 0.25 * h and it.y0 <= op.y1 + 1.1 * S]
-            if op.ch == "∫":  # integral limits are scripts to the right, handled by the line layout
-                upper, lower = [], []
+            # (integral limits set to the right are scripts, handled by the line layout)
             # a big (display) operator is taller than the text around it; centre it on the maths axis
             base = op.cy + 0.25 * S if op.y1 - op.y0 > 1.2 * S else op.base
             items = [op] + upper + lower
@@ -691,7 +727,7 @@ def _node_core(node: Node, problems: list[str]) -> str:
         if it.ch in BIG_OPS:
             return BIG_OPS[it.ch]
         tex = glyph_tex(it, problems)
-        if it.ch in "()[]|" and it.y1 - it.y0 > 1.7 * it.size:
+        if it.ch in "()[]|" and (it.big or it.y1 - it.y0 > 1.7 * it.size):
             return "\x00big" + it.ch
         return tex
     if isinstance(it, Frac):
@@ -813,7 +849,7 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
             continue
         tex = math_tex([node], problems) if kind == "math" else glyph_tex(it, problems) if isinstance(it, Glyph) \
             else math_tex([node], problems)
-        if isinstance(it, Glyph) and it.ch in "()[]|" and it.y1 - it.y0 > 1.7 * it.size:
+        if isinstance(it, Glyph) and it.ch in "()[]|" and (it.big or it.y1 - it.y0 > 1.7 * it.size):
             tex = "\x00big" + it.ch
             kind = "math"
         if kind == "neutral" and isinstance(it, Glyph) and it.ch == "-" and not it.math_font:

@@ -18,8 +18,8 @@ needs_ocr = pytest.mark.skipif(find_tessdata() is None, reason="Tesseract OCR no
 
 
 def norm(s: str) -> str:
-    """Compare maths ignoring spacing and optional braces around one-character scripts."""
-    s = s.replace("\\leq", "\\le").replace("\\geq", "\\ge").replace("\\neq", "\\ne").replace("\\,", " ")
+    """Compare maths ignoring spacing, bracket sizing and optional braces around one-character scripts."""
+    s = s.replace("\\left(", "(").replace("\\right)", ")").replace("\\leq", "\\le").replace("\\geq", "\\ge").replace("\\neq", "\\ne").replace("\\,", " ")
     s = re.sub(r"\^\{(.)\}", r"^\1", s)
     s = re.sub(r"_\{(.)\}", r"_\1", s)
     return re.sub(r"\s+", "", s)
@@ -29,10 +29,11 @@ def convert(pdf, tmp_path, **kw):
     return convert_pdf(pdf, ConvertOptions(render_check=False, **kw), out_dir=tmp_path)
 
 
-@pytest.mark.parametrize("variant", ["cm", "times", "unicode"])
+@pytest.mark.parametrize("variant", ["latex_cm", "latex_times", "latex_unicode", "word_paper"])
 def test_every_question_exact(variant, tmp_path):
-    """Three typesetting styles: LaTeX fonts, Times, Word-style Unicode maths (options across the line)."""
-    res = convert(DATA / f"latex_{variant}.pdf", tmp_path)
+    """LaTeX fonts, Times, Unicode maths (options across the line), and a Word .docx exported by LibreOffice
+    ("1." numbers inline, native Word equations, pasted pictures, a Word table)."""
+    res = convert(DATA / f"{variant}.pdf", tmp_path)
     data = load_paper_dict(res.output_path)
     assert (data["title"], data["paper"], data["year"], data["durationMinutes"]) == \
         (EXPECTED["title"], "Paper 1", "2026", 75)
@@ -42,7 +43,11 @@ def test_every_question_exact(variant, tmp_path):
         assert [o["label"] for o in q["options"]] == [o["label"] for o in e["options"]]
         assert [norm(o["content"]) for o in q["options"]] == [norm(o["content"]) for o in e["options"]], q["number"]
         assert bool(q["images"]) == e["has_image"], q["number"]
-        assert q["needsReview"] is False, (q["number"], res.questions[q["number"]].review_reasons)
+        reasons = res.questions[q["number"]].review_reasons
+        if variant == "word_paper" and q["number"] == 3:  # graph letters only exist inside a pasted picture
+            assert reasons == ["the graph letters were read from inside a picture - check the options match"]
+        else:
+            assert q["needsReview"] is False, (q["number"], reasons)
     assert res.report.ok, res.report.format()
 
 
@@ -159,3 +164,59 @@ def test_picture_without_ocr_gives_clear_error(tmp_path, monkeypatch):
     pymupdf.open(DATA / "latex_cm.pdf")[1].get_pixmap(dpi=100).save(png)
     with pytest.raises(Exception, match="Tesseract"):
         convert(png, tmp_path)
+
+
+def _norm_math_only(s):
+    return norm(s)
+
+
+def test_drawn_root_sign(tmp_path):
+    """Root signs drawn as lines (MathType style) are read as \\sqrt."""
+    doc = pymupdf.open()
+    pg = doc.new_page()
+    pg.insert_text((50, 100), "1", fontsize=11, fontname="Helvetica-Bold")
+    pg.insert_text((80, 100), "Find", fontsize=11, fontname="Times-Roman")
+    sh = pg.new_shape()
+    sh.draw_polyline([(106, 95), (109, 93), (112, 102), (116, 88), (132, 88)])
+    sh.finish(color=(0, 0, 0), width=0.6, closePath=False)
+    sh.commit()
+    pg.insert_text((117, 100), "17", fontsize=11, fontname="Times-Roman")
+    for i, (lab, txt) in enumerate((("A", "1"), ("B", "2"))):
+        pg.insert_text((80, 130 + 20 * i), lab, fontsize=11, fontname="Helvetica-Bold")
+        pg.insert_text((110, 130 + 20 * i), txt, fontsize=11, fontname="Times-Roman")
+    doc.save(tmp_path / "root.pdf")
+    res = convert(tmp_path / "root.pdf", tmp_path)
+    assert norm(res.paper.questions[0].stem) == norm("Find $\\sqrt{17}$")
+
+
+def test_no_question_numbers_falls_back_to_pages(tmp_path):
+    doc = pymupdf.open()
+    for i in range(2):
+        pg = doc.new_page()
+        pg.insert_text((80, 100), f"What is {i} plus {i}?", fontsize=11, fontname="Times-Roman")
+        for k, lab in enumerate("ABC"):
+            pg.insert_text((80, 130 + 20 * k), lab, fontsize=11, fontname="Helvetica-Bold")
+            pg.insert_text((110, 130 + 20 * k), str(k), fontsize=11, fontname="Times-Roman")
+    doc.save(tmp_path / "nonum.pdf")
+    res = convert(tmp_path / "nonum.pdf", tmp_path)
+    assert len(res.paper.questions) == 2
+    assert all(q.needsReview and len(q.options) == 3 for q in res.paper.questions)
+
+
+def test_one_bad_question_does_not_fail_the_paper(tmp_path, monkeypatch):
+    from tmua_converter import pipeline
+
+    real = pipeline.Converter._question
+
+    def boom(self, n):
+        if n == 4:
+            raise RuntimeError("unexpected layout")
+        return real(self, n)
+
+    monkeypatch.setattr(pipeline.Converter, "_question", boom)
+    res = convert(DATA / "latex_cm.pdf", tmp_path)
+    q4 = res.questions[4]
+    assert q4.needs_review and "could not be rebuilt automatically" in q4.review_reasons[0]
+    assert res.paper.questions[3].stem.startswith("Evaluate")
+    assert [o.label for o in res.paper.questions[3].options] == list("ABCDE")
+    assert not res.paper.questions[4].needsReview

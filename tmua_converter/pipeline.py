@@ -225,6 +225,7 @@ class Converter:
         self._glyph_cache: dict[int, list[ml.Glyph]] = {}
         self._ignored: set[int] = set()
         self._ocr_rules: dict[int, list[ml.Rule]] = {}
+        self._page_fallback = False
         try:
             if self._renderer is None and self.opt.render_check:
                 self._renderer = try_start_renderer()
@@ -257,14 +258,23 @@ class Converter:
         meta = read_metadata(doc, pdf_path.name)
         anchors = doc.find_question_anchors()
         if not anchors:
-            raise ConversionError("No question numbers were found in the left margin, so the questions could not "
-                                  "be located.")
+            anchors = self._page_anchors()
+            if not anchors:
+                raise ConversionError("No questions could be found in this PDF.")
+            self.notes.append("No question numbers were found, so each page with answer options was taken as one "
+                              "question. Check the split on the review page.")
         expected = self.opt.expected_questions or meta.get("stated_question_count") or None
         self.progress("pass1", f"Found {len(anchors)} questions; rebuilding text and maths from the page layout")
 
         questions: dict[int, QuestionState] = {}
         for n in sorted(anchors):
-            q = questions[n] = self._question(n)
+            try:
+                q = questions[n] = self._question(n)
+            except Exception as exc:  # noqa: BLE001 - never lose the whole paper to one odd question
+                log.exception("question %s could not be rebuilt", n)
+                q = questions[n] = self._plain_question(n, exc)
+            if self._page_fallback:
+                q.flag("question numbers were not found: this question is one whole page - check the split")
             self.progress("pass1", f"Question {n}: {len(q.options)} options, {len(q.figures)} image(s)"
                           + (" - flagged for review" if q.needs_review else ""))
         if expected and expected != len(anchors):
@@ -274,7 +284,10 @@ class Converter:
         # ------------------------------------------------------------ pass 2: cross-check vs the PDF text layer
         self.progress("pass2", "Cross-checking every question against the characters printed in the PDF")
         for q in questions.values():
-            self._cross_check(q)
+            try:
+                self._cross_check(q)
+            except Exception as exc:  # noqa: BLE001
+                q.flag(f"the character cross-check could not run ({exc})")
 
         # ------------------------------------------------------------ pass 3: write, reload, validate
         title, paper_name, year, duration = self._final_metadata(meta)
@@ -330,7 +343,12 @@ class Converter:
             furniture = [ln.box for ln in self.doc.lines(page) if self.doc.is_furniture(ln, page)]
             glyphs = [g for g in glyphs if not any(_inside(g, f.expand(1)) for f in furniture)]
             dash_rules, glyphs = ml.ocr_dash_rules(glyphs)
-            self._ocr_rules[page] = dash_rules
+            with self.doc._lock:
+                rad_rules, rad_signs = ml.page_radicals(self.doc._page(page))
+            for sign in rad_signs:
+                sign.page = page
+            glyphs += rad_signs
+            self._ocr_rules[page] = dash_rules + rad_rules
             self._glyph_cache[page] = glyphs
         return self._glyph_cache[page]
 
@@ -390,6 +408,7 @@ class Converter:
         found: list[str] = []
         current: str | None = None
         label_col: float | None = None  # x of the "A" label; OCR may glue later labels to their text
+        label_bold = False
         for ln in lines:
             its = sorted(ln.items, key=lambda i: i.x0)
             cur: list[ml.Item] = []
@@ -398,11 +417,14 @@ class Converter:
                 nxt = its[k + 1] if k + 1 < len(its) else None
                 prv = its[k - 1] if k else None
                 spaced = (nxt is None or nxt.x0 - it.x1 >= 0.45 * S) and (prv is None or it.x0 - prv.x1 >= 1.0 * S)
-                ocr_column = isinstance(it, ml.Glyph) and it.ocr and label_col is not None and k == 0 \
-                    and abs(it.x0 - label_col) < 0.3 * S
+                # after "A", a label may be jammed against its text (tabs, OCR): accept the next letter
+                # when it starts a line in the same column as "A" and is styled like it
+                ocr_column = isinstance(it, ml.Glyph) and label_col is not None and k == 0 \
+                    and abs(it.x0 - label_col) < 0.3 * S and (it.ocr or it.bold == label_bold)
                 if want and isinstance(it, ml.Glyph) and it.ch == want and not it.math_font and (spaced or ocr_column):
                     if want == "A":
                         label_col = it.x0
+                        label_bold = it.bold
                     if cur:
                         segments[current].append(_subline(cur, ln))
                     cur = []
@@ -439,6 +461,11 @@ class Converter:
                 for lab in found]
         if len(opts) < 2:
             seq: list[str] = []
+            if not any(f.labels for f in q.figures):
+                for f in q.figures:  # letters drawn inside a pasted picture
+                    f.labels = self._picture_labels(f.crop, S)
+                    if f.labels:
+                        q.flag("the graph letters were read from inside a picture - check the options match")
             fig_labels = [lab for f in q.figures for lab in f.labels]
             for lab in fig_labels:
                 if len(seq) < len(LABELS) and lab == LABELS[len(seq)]:
@@ -466,6 +493,83 @@ class Converter:
         q.history.append(f"pass 1: rebuilt from {len(glyphs)} characters and {sum(r.used for r in rules)} "
                          f"fraction/root bars on page(s) {pages}")
         return q
+
+    def _page_anchors(self) -> dict:
+        """No question numbers: treat each page that has answer options as one question."""
+        from .pdf import Anchor
+
+        doc = self.doc
+        pages = []
+        for p in range(1, doc.page_count + 1):
+            if doc.is_blank_page(p):
+                continue
+            lines = doc.content_lines(p)
+            if any(re.match(r"^\(?A[.)]?(\s|$)", ln.text) for ln in lines):
+                pages.append(p)
+        if not pages:
+            pages = [p for p in range(2 if doc.page_count > 1 else 1, doc.page_count + 1) if not doc.is_blank_page(p)]
+        anchors = {}
+        for n, p in enumerate(pages, start=1):
+            content = doc.content_box(p) or doc.page_box(p)
+            anchors[n] = Anchor(n, p, Box(content.x0 - 1, content.y0, content.x0 - 0.5, content.y0 + 1))
+        doc._anchors = anchors
+        self._page_fallback = True
+        return anchors
+
+    def _plain_question(self, n: int, exc: Exception) -> QuestionState:
+        """Fallback: the question's plain text, options split at lines starting with A, B, C, ..."""
+        doc = self.doc
+        anchor = doc.find_question_anchors()[n]
+        regions = doc.question_regions(n)
+        q = QuestionState(number=n, stem="", options=[], source_page=anchor.page, regions=regions)
+        stem_lines: list[str] = []
+        opts: list[dict] = []
+        for page, box in regions:
+            for ln in doc.content_lines(page):
+                if not box.contains(ln.box, tol=2):
+                    continue
+                text = ln.text
+                if ln.box.intersect(anchor.box).area > 0:
+                    text = re.sub(r"^\s*\d{1,3}[.):]?(\s+|$)", "", text)
+                if not text.strip():
+                    continue
+                m = re.match(r"^\(?([A-H])[.)]?(?:\s+(.*))?$", text)
+                if m and len(opts) < len(LABELS) and m.group(1) == LABELS[len(opts)]:
+                    opts.append({"label": m.group(1), "content": (m.group(2) or "").strip()})
+                elif opts:
+                    opts[-1]["content"] += " " + text
+                else:
+                    stem_lines.append(text)
+        q.stem = " ".join(stem_lines).strip()
+        q.options = opts
+        q.flag(f"this question could not be rebuilt automatically ({type(exc).__name__}: {exc}); its plain text "
+               "was used - check the maths")
+        return q
+
+    def _picture_labels(self, crop: CropResult, S: float) -> list[str]:
+        """Option letters inside a figure that is a picture: OCR them if possible, otherwise
+        count the separate graphs in the panel (they are lettered A, B, C, ... in reading order)."""
+        from .ocr import find_tessdata
+
+        tessdata = find_tessdata()
+        if tessdata:
+            try:
+                import pymupdf
+
+                pix = pymupdf.Pixmap(crop.png)
+                ocr = pymupdf.open("pdf", pix.pdfocr_tobytes(language="eng", tessdata=tessdata))
+                letters = [w for w in ocr[0].get_text("words") if w[4].strip(".()") in LABELS]
+                letters.sort(key=lambda w: (round(w[1] / 20), w[0]))
+                labels = [w[4].strip(".()") for w in letters]
+                if "A" in labels and len(set(labels)) >= 2:
+                    return list(LABELS[:LABELS.index(max(set(labels) & set(LABELS))) + 1])
+            except Exception as exc:  # noqa: BLE001 - fall back to counting graphs
+                log.info("OCR of figure failed: %s", exc)
+        blobs = [b for b in self.doc.ink_components(crop.page, crop.box_pt, [])
+                 if b.width >= 2.5 * S and b.height >= 2.5 * S]
+        if 2 <= len(blobs) <= len(LABELS):
+            return list(LABELS[:len(blobs)])
+        return []
 
     def _ocr_label_rows(self, regions, lines, S: float, label_col: float | None) -> list[tuple[int, Box]]:
         """Answer labels in a picture, found from the ink: a letter-sized mark in the label column

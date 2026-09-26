@@ -27,7 +27,10 @@ MODEL_LONG_EDGE = 2576  # max image long edge used by current Claude vision mode
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
 # Fonts LaTeX's picture mode uses to draw slanted lines and circles: graphics, not text.
 _DRAWING_FONT_RE = re.compile(r"^(LINE|LCIRCLE|LCIRCLEW)\d*", re.I)
-_NUMBER_ONLY_RE = re.compile(r"[\-–—\s]*\d{1,3}[\-–—\s]*")
+_NUMBER_ONLY_RE = re.compile(r"[\-–—\s]*\(?\d{1,3}[.):]?[\-–—\s]*")
+# Lines that start with a question marker: never running headers, even when a
+# question happens to start at the same height on many pages.
+_QUESTION_START_RE = re.compile(r"^\s*(?:(?:Question|Q)\s*)?\d{1,3}[.):]?(?:\s|$)", re.I)
 _BLANK_PAGE_RE = re.compile(r"(blank\s*page|intentionally\s*(left\s*)?blank)", re.I)
 
 
@@ -104,6 +107,7 @@ class TextLine:
     first_span_box: Box
     first_span_bold: bool
     size: float
+    number_box: "Box | None" = None  # box of a leading "12." if the line starts with one
 
 
 @dataclass(frozen=True)
@@ -390,6 +394,14 @@ class PdfDocument:
                 first = spans[0]
                 font = first.get("font", "")
                 bold = bool(first.get("flags", 0) & 16) or "bold" in font.lower() or "black" in font.lower()
+                number_box = None
+                lead = [c for c in first.get("chars", []) if not c["c"].isspace()]
+                k = 0
+                while k < len(lead) and (lead[k]["c"].isdigit() or (k and lead[k]["c"] in ".):")):
+                    k += 1
+                if 0 < k < len(lead) and lead[0]["c"].isdigit():
+                    number_box = Box(min(c["bbox"][0] for c in lead[:k]), min(c["bbox"][1] for c in lead[:k]),
+                                     max(c["bbox"][2] for c in lead[:k]), max(c["bbox"][3] for c in lead[:k]))
                 out.append(TextLine(
                     text=text,
                     box=Box.of(line["bbox"]),
@@ -397,6 +409,7 @@ class PdfDocument:
                     first_span_box=Box.of(first["bbox"]),
                     first_span_bold=bold,
                     size=float(first.get("size", 0.0)),
+                    number_box=number_box,
                 ))
         out.sort(key=lambda ln: (round(ln.box.y0, 1), ln.box.x0))
         self._lines_cache[page] = out
@@ -419,8 +432,8 @@ class PdfDocument:
         for p in range(1, self.page_count + 1):
             seen = set()
             for ln in self.lines(p):
-                if _NUMBER_ONLY_RE.fullmatch(ln.text):
-                    continue  # bare numbers are handled by position (question markers vs page numbers)
+                if _NUMBER_ONLY_RE.fullmatch(ln.text) or _QUESTION_START_RE.match(ln.text):
+                    continue  # numbers are handled by position (question markers vs page numbers)
                 key = (re.sub(r"\d+", "#", ln.text.lower()), round(ln.box.y0 / 6))
                 if key not in seen:
                     seen.add(key)
@@ -433,7 +446,7 @@ class PdfDocument:
         box = self.page_box(page)
         in_margin = ln.box.y1 < box.height * 0.09 or ln.box.y0 > box.height * 0.91
         key = (re.sub(r"\d+", "#", ln.text.lower()), round(ln.box.y0 / 6))
-        if key in self._furniture_keys():
+        if key in self._furniture_keys() and not _QUESTION_START_RE.match(ln.text):
             return True
         # Bare page numbers sit in the top/bottom margin away from the left edge;
         # a bare number at the left margin is a question marker, not furniture.
@@ -531,15 +544,26 @@ class PdfDocument:
         cands: list[tuple[Anchor, bool]] = []
         for p in range(1, self.page_count + 1):
             pw = self.page_box(p).width
-            for ln in self.content_lines(p):
+            page_lines = self.content_lines(p)
+            for ln in page_lines:
                 if ln.first_span_box.x0 > pw * 0.25:
                     continue
+                # a question number is the first thing on its line (not an answer value after "B")
+                if any(o is not ln and o.box.x1 <= ln.first_span_box.x0 + 1 and
+                       min(o.box.y1, ln.box.y1) - max(o.box.y0, ln.box.y0) > 0.5 * min(o.box.height, ln.box.height)
+                       for o in page_lines):
+                    continue
+                box = ln.first_span_box
                 m = re.fullmatch(r"(\d{1,3})[.):]?", ln.first_span_text)
+                if not m:  # "1. Find ..." in one piece of text (common in Word-made PDFs)
+                    m = re.match(r"(\d{1,3})[.):]?(?=\s)", ln.first_span_text)
+                    if m:
+                        box = ln.number_box or box
                 if not m:  # "Question 7", "Q7." styles
                     m = re.match(r"(?:Question|Q)\s*(\d{1,3})(?![\d])[.):]?", ln.text)
                 if not m:
                     continue
-                cands.append((Anchor(int(m.group(1)), p, ln.first_span_box), ln.first_span_bold))
+                cands.append((Anchor(int(m.group(1)), p, box), ln.first_span_bold))
         best: tuple[tuple[int, int, float], dict[int, Anchor]] | None = None
         for col in sorted({round(a.box.x0 / 8) for a, _ in cands}):
             column = sorted((c for c in cands if abs(round(c[0].box.x0 / 8) - col) <= 1),
@@ -582,8 +606,13 @@ class PdfDocument:
             left = max(0.0, min(content.x0, a.box.x0 if page == a.page else content.x0) - 6)
             return Box(left, max(0.0, top), min(pbox.width, content.x1 + 6), min(pbox.height, bottom))
 
-        same_page_end = nxt.box.y0 - 6 if nxt is not None and nxt.page == a.page else None
-        top = a.box.y0 - 6
+        # A question starts a little above its number (tall maths such as integral limits or
+        # fractions on the first line rise above it); the previous one ends at the same point.
+        def lead(anchor) -> float:
+            return max(6.0, 0.9 * anchor.box.height)
+
+        same_page_end = nxt.box.y0 - lead(nxt) if nxt is not None and nxt.page == a.page else None
+        top = a.box.y0 - lead(a)
         # A picture pasted inline sits on the text baseline, so its question number is printed at
         # the picture's bottom-left: the question then starts at the top of the picture.
         prev = anchors.get(number - 1)
@@ -607,7 +636,7 @@ class PdfDocument:
             if content is None:
                 continue
             first_marker = min((x for x in anchors.values() if x.page == p), key=lambda x: x.box.y0, default=None)
-            limit = first_marker.box.y0 - 3 if first_marker is not None else None
+            limit = first_marker.box.y0 - lead(first_marker) if first_marker is not None else None
             if limit is not None and content.y0 >= limit - 2:
                 break  # nothing above the next question's marker: no overflow
             region = span(p, content.y0 - 6, limit)
