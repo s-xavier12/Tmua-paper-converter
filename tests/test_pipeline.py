@@ -220,3 +220,22 @@ def test_one_bad_question_does_not_fail_the_paper(tmp_path, monkeypatch):
     assert res.paper.questions[3].stem.startswith("Evaluate")
     assert [o.label for o in res.paper.questions[3].options] == list("ABCDE")
     assert not res.paper.questions[4].needsReview
+
+
+@pytest.mark.parametrize("lines", [
+    ["(A) 4      (B) 5      (C) 6      (D) 7"],
+    ["A. 4", "B. 5", "C. 6", "D. 7"],
+    ["A) 4   B) 5", "C) 6   D) 7"],
+    ["A 4   B 5   C 6   D 7"],
+])
+def test_option_label_styles(tmp_path, lines):
+    import pymupdf
+
+    d = pymupdf.open()
+    p = d.new_page()
+    for i, text in enumerate(["1. A box holds 2 and 3. What is the sum?"] + lines):
+        p.insert_text((50, 60 + 22 * i), text, fontsize=11, fontname="Times-Roman")
+    d.save(tmp_path / "p.pdf")
+    q = convert_pdf(tmp_path / "p.pdf", ConvertOptions(render_check=False), tmp_path).paper.questions[0]
+    assert q.stem == "A box holds 2 and 3. What is the sum?"
+    assert [(o.label, o.content) for o in q.options] == [("A", "$4$"), ("B", "$5$"), ("C", "$6$"), ("D", "$7$")]

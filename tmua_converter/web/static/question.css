@@ -3,12 +3,16 @@
   line-height: 1.5; color: #111; background: #fff; }
 .tmua-qnum { font-family: system-ui, sans-serif; font-weight: 700; min-width: 1.6em; }
 .tmua-qbody { flex: 1; min-width: 0; }
-.tmua-stem p { margin: 0 0 0.7em; }
+.tmua-stem p { margin: 0 0 0.8em; }
+.tmua-stem .katex-display { overflow-x: auto; overflow-y: hidden; }
 .tmua-fig { margin: 0.4em 0 0.9em; }
 .tmua-fig img { max-width: min(100%, 560px); height: auto; display: block; }
-.tmua-options { margin-top: 0.4em; }
-.tmua-option { display: flex; gap: 12px; margin: 0.35em 0; align-items: baseline; }
-.tmua-label { font-family: system-ui, sans-serif; font-weight: 700; min-width: 1.3em; }
+.tmua-options { display: flex; flex-direction: column; gap: 8px; margin-top: 1em; }
+.tmua-option { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border: 1px solid #d9dde3;
+  border-radius: 8px; background: #fafbfc; }
+.tmua-label { font-family: system-ui, sans-serif; font-weight: 700; font-size: 14px; flex: none; width: 28px;
+  height: 28px; border-radius: 50%; border: 1.5px solid #8a929e; display: grid; place-items: center; color: #333; }
+.tmua-content { flex: 1; min-width: 0; overflow-x: auto; }
 .tmua-content p { margin: 0; }
 .tmua-q .katex-display { margin: 0.5em 0; }
 .tmua-q .katex { font-size: 1.08em; }

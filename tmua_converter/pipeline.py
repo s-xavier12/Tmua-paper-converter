@@ -409,19 +409,33 @@ class Converter:
         current: str | None = None
         label_col: float | None = None  # x of the "A" label; OCR may glue later labels to their text
         label_bold = False
-        for ln in lines:
+        chain = _label_chain(lines, S)
+        for li, ln in enumerate(lines):
             its = sorted(ln.items, key=lambda i: i.x0)
             cur: list[ml.Item] = []
+            skip_to = -1
             for k, it in enumerate(its):
+                if k <= skip_to:
+                    continue
                 want = LABELS[len(found)] if len(found) < len(LABELS) else None
-                nxt = its[k + 1] if k + 1 < len(its) else None
-                prv = its[k - 1] if k else None
-                spaced = (nxt is None or nxt.x0 - it.x1 >= 0.45 * S) and (prv is None or it.x0 - prv.x1 >= 1.0 * S)
+                hit = chain.get((li, k))
+                if want and hit and hit[0] == want:
+                    if want == "A":
+                        label_col = it.x0
+                        label_bold = it.bold if isinstance(it, ml.Glyph) else False
+                    if cur:
+                        segments[current].append(_subline(cur, ln))
+                    cur = []
+                    current = want
+                    found.append(want)
+                    segments[current] = []
+                    skip_to = hit[1]
+                    continue
                 # after "A", a label may be jammed against its text (tabs, OCR): accept the next letter
                 # when it starts a line in the same column as "A" and is styled like it
                 ocr_column = isinstance(it, ml.Glyph) and label_col is not None and k == 0 \
                     and abs(it.x0 - label_col) < 0.3 * S and (it.ocr or it.bold == label_bold)
-                if want and isinstance(it, ml.Glyph) and it.ch == want and not it.math_font and (spaced or ocr_column):
+                if want and isinstance(it, ml.Glyph) and it.ch == want and not it.math_font and ocr_column:
                     if want == "A":
                         label_col = it.x0
                         label_bold = it.bold
@@ -686,6 +700,64 @@ class Converter:
         expected_duration = self.opt.duration_minutes or int(meta.get("duration_minutes") or 0) or None
         return validate_paper(data, expected_questions=expected, expected_duration=expected_duration, pdf=self.doc,
                               katex_errors=katex_errors)
+
+
+def _label_at(its: list, k: int, S: float) -> tuple[str, int, bool] | None:
+    """An answer label starting at its[k]: A, (A), A. or A) standing apart from its neighbours.
+    Returns (letter, index of its last item, strong)."""
+    def glyph(j: int, chars: str):
+        g = its[j] if j < len(its) else None
+        return g if isinstance(g, ml.Glyph) and g.ch in chars and not g.math_font else None
+
+    j = k
+    paren = glyph(j, "(") is not None
+    if paren:
+        j += 1
+    if glyph(j, LABELS) is None:
+        return None
+    letter = its[j].ch
+    close = glyph(j + 1, ").")
+    if paren and not (close and close.ch == ")"):
+        return None
+    end = j + 1 if close else j
+    if close and its[end].x0 - its[j].x1 > 0.3 * S:
+        return None
+    prv = its[k - 1] if k else None
+    nxt = its[end + 1] if end + 1 < len(its) else None
+    gap = nxt.x0 - its[end].x1 if nxt is not None else 99 * S
+    before = its[k].x0 - prv.x1 if prv is not None else 99 * S
+    if before < (0.5 if close or gap < 0.45 * S else 1.0) * S:  # a word space is about 0.25 S
+        return None
+    if close:
+        return (letter, end, True) if gap >= 0.1 * S else None
+    if gap >= 0.45 * S:
+        return letter, end, True
+    return (letter, end, False) if gap >= 0.12 * S else None
+
+
+def _label_chain(lines: list, S: float) -> dict[tuple[int, int], tuple[str, int]]:
+    """The run of labels A, B, C, ... that marks the options: the longest run (the latest on ties).
+    Loosely spaced letters ("A 1  B 2") count only when at least three follow on in order."""
+    cands = []
+    for li, ln in enumerate(lines):
+        its = sorted(ln.items, key=lambda i: i.x0)
+        for k in range(len(its)):
+            c = _label_at(its, k, S)
+            if c:
+                cands.append((li, k, *c))
+    best: list = []
+    for i, c in enumerate(cands):
+        if c[2] != "A":
+            continue
+        run = [c]
+        for d in cands[i + 1:]:
+            if len(run) < len(LABELS) and d[2] == LABELS[len(run)]:
+                run.append(d)
+        if not all(r[4] for r in run) and len(run) < 3:
+            run = [r for r in run[:1] if r[4]]
+        if len(run) >= len(best) and run:
+            best = run
+    return {(r[0], r[1]): (r[2], r[3]) for r in best}
 
 
 def _numeric_as_maths(text: str) -> str:
