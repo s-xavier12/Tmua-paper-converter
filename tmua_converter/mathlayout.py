@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 import statistics
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import replace, dataclass, field
 
 # --------------------------------------------------------------------------- character tables
 GREEK = {
@@ -51,6 +51,8 @@ SYMBOLS = {
     "%": "\\%", "#": "\\#", "&": "\\&", "£": "\\pounds", "$": "\\$",
 }
 PLAIN_MATH = set("=<>+*|")
+UNI_SUP = dict(zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ", "0123456789+−=()ni"))
+UNI_SUB = dict(zip("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎", "0123456789+−=()"))
 PUNCT = set(",.;:?!()[]'\"‘’“”/")
 BIG_OPS = {"∑": "\\sum", "∏": "\\prod", "∫": "\\int", "∮": "\\oint", "⋃": "\\bigcup", "⋂": "\\bigcap"}
 FUNCTIONS = ("arcsin arccos arctan sinh cosh tanh sin cos tan sec cosec csc cot log ln exp lim max min det "
@@ -179,6 +181,8 @@ def normalise_char(c: str, font: str) -> tuple[str, bool]:
             return CMEX[c], True
     if c in ("\u2212",):
         return "−", True
+    if c in UNI_SUP or c in UNI_SUB:
+        return c, True  # kept so the layout can make it a script
     n = unicodedata.normalize("NFKC", c)
     if len(n) == 1:
         c = n
@@ -441,6 +445,20 @@ class Builder:
                     grew = True
         return group
 
+    def _is_underline(self, rule: Rule) -> bool:
+        """A line just under the baseline of body-size text that carries on past the line's ends."""
+        S = self.S
+        over = [it for it in self.items if isinstance(it, Glyph) and self._in_x(it, rule.x0, rule.x1)
+                and 0 <= rule.y - it.base < 0.25 * S and abs(it.size - S) < 0.15 * S]
+        if not over:
+            return False
+        base = statistics.median(g.base for g in over)
+        for it in self.items:
+            if isinstance(it, Glyph) and abs(it.base - base) < 0.1 * S and abs(it.size - S) < 0.15 * S \
+                    and (0 <= rule.x0 - it.x1 < 1.5 * S or 0 <= it.x0 - rule.x1 < 1.5 * S):
+                return True
+        return False
+
     def _replace(self, old: list[Item], new: Item) -> None:
         ids = {id(o) for o in old}
         self.items = [i for i in self.items if id(i) not in ids]
@@ -479,6 +497,9 @@ class Builder:
             rule.used = True
             self._replace(body + [sign] + index, Root(x0, min(y0, rule.y), x1, y1, base, max(b.size for b in body),
                                                       body=body, index=index, sign=sign))
+            return
+        if self._is_underline(rule):
+            rule.used = True  # emphasis, not maths
             return
         num = self._collect(rule, above=True)
         den = self._collect(rule, above=False)
@@ -548,6 +569,17 @@ def hlist(items: list[Item], problems: list[str]) -> list[Node]:
     i = 0
     while i < len(items):
         it = items[i]
+        if nodes and isinstance(it, Glyph) and (it.ch in UNI_SUP or it.ch in UNI_SUB):
+            # typed as a superscript/subscript character (n², x₁): a script, not a new symbol
+            table = UNI_SUP if it.ch in UNI_SUP else UNI_SUB
+            j = i
+            while j < len(items) and isinstance(items[j], Glyph) and items[j].ch in table:
+                j += 1
+            run = [replace(g, ch=table[g.ch]) for g in items[i:j]]
+            target = nodes[-1]
+            (target.sup if table is UNI_SUP else target.sub).extend(Node(g) for g in run)
+            i = j
+            continue
         small = it.size < 0.86 * base_size
         direction = None
         if small and nodes:
@@ -670,7 +702,20 @@ def tidy_math(tex: str) -> str:
         was_unary = unary
         prev = t
         prev_end = start + len(t)
-    return "".join(out).strip()
+    return clean_braces("".join(out).strip())
+
+
+def clean_braces(tex: str) -> str:
+    """Drop braces that do nothing: empty scripts x^{}, empty groups {}, doubled {{...}},
+    and single-character scripts x^{2} -> x^2."""
+    prev = None
+    while prev != tex:
+        prev = tex
+        tex = re.sub(r"[\^_]\{\s*\}", "", tex)
+        tex = re.sub(r"(?<![\\A-Za-z}\]])\{\s*\}", "", tex)
+        tex = re.sub(r"\{\{([^{}]*)\}\}", r"{\1}", tex)
+        tex = re.sub(r"([\^_])\{([A-Za-z0-9])\}", r"\1\2", tex)
+    return tex
 
 
 def math_tex(nodes: list[Node], problems: list[str]) -> str:
@@ -840,9 +885,9 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
             italic_var = _italic_maths_word(word, word_nodes, nodes, i, j)
             if word in FUNCTIONS or italic_var or (scripted and len(word) == 1):
                 tokens.append(Token("math", math_tex(word_nodes, problems), gap, word_nodes[0]))
-            elif scripted:
-                tokens.append(Token("text", word[:-1], gap, word_nodes[0]))
-                tokens.append(Token("math", math_tex(word_nodes[-1:], problems), False, word_nodes[-1]))
+            elif scripted:  # a unit such as cm² or km²: the word stays prose, the power is maths
+                tokens.append(Token("text", word, gap, word_nodes[0]))
+                tokens.append(Token("math", _scripts(word_nodes[-1], problems), False, word_nodes[-1]))
             else:
                 tokens.append(Token("text", word, gap, word_nodes[0]))
             i = j
@@ -856,7 +901,38 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
             tex = "-"
         tokens.append(Token(kind, tex, gap, node))
         i += 1
+    return _upright_variables(tokens)
+
+
+_OPERATOR_CHARS = set("+-−=<>≤≥≠×÷^(")
+
+
+def _upright_variables(tokens: list[Token]) -> list[Token]:
+    """A lone upright letter (other than a, A, I) next to maths or an operator is a variable,
+    as in "n² + n" typed in a word processor without an equation editor."""
+    def mathy(t: Token | None, left: bool) -> bool:
+        if t is None:
+            return False
+        if t.kind == "math":
+            return True
+        if t.kind != "neutral":
+            return False
+        return (t.tex[-1:] if left else t.tex[:1]) in _OPERATOR_CHARS or (not left and t.tex == ")") \
+            or (left and t.tex == "(")
+    changed = True
+    while changed:
+        changed = False
+        for k, t in enumerate(tokens):
+            if t.kind == "text" and len(t.tex) == 1 and t.tex.isalpha() and t.tex not in "aAI":
+                if mathy(tokens[k - 1] if k else None, True) or mathy(tokens[k + 1] if k + 1 < len(tokens) else None,
+                                                                    False):
+                    t.kind = "math"
+                    changed = True
     return tokens
+
+
+_ORDINAL_RE = re.compile(r"(\d+)\^\{?(st|nd|rd|th)\}?")
+_ORDINAL_IN_MATHS_RE = re.compile(r"(?<=\d\^\{)(st|nd|rd|th)(?=\})")
 
 
 def _split_islands(tokens: list[Token]) -> list[Token]:
@@ -936,13 +1012,17 @@ def tokens_to_text(tokens: list[Token]) -> str:
             continue
         # trailing punctuation that is not closing a bracket opened inside the maths stays outside
         tail: list[Token] = []
-        while island and island[-1].kind == "neutral" and island[-1].tex in (",", ".", ";", ":", "?", "!", ")", "]"):
+        while island and island[-1].kind == "neutral" and island[-1].tex in (",", ".", ";", ":", "?", "!", ")", "]", "(", "["):
             last = island[-1]
             body = "".join(tok.tex for tok in island[:-1])
             if last.tex in ")]" and body.count("(" if last.tex == ")" else "[") > body.count(last.tex):
                 break
             tail.insert(0, island.pop())
         head: list[Token] = []
+        # punctuation stuck to the word before ("Note:", "e.g.") is prose, not the start of the maths
+        while island and island[0].kind == "neutral" and island[0].tex in (",", ".", ";", ":", "?", "!") \
+                and not island[0].gap:
+            head.append(island.pop(0))
         while island and island[0].kind == "neutral" and island[0].tex in ("(", "["):
             rest = "".join(tok.tex for tok in island[1:])
             close = ")" if island[0].tex == "(" else "]"
@@ -952,10 +1032,15 @@ def tokens_to_text(tokens: list[Token]) -> str:
         lead_gap = (head[0].gap if head else island[0].gap if island else False) and bool(out)
         prefix = "".join(tok.tex for tok in head)
         maths = tidy_math(_pair_big_delimiters(_join([(tok.tex, tok.gap and k > 0) for k, tok in enumerate(island)])))
-        suffix = "".join(tok.tex for tok in tail)
+        suffix = "".join((" " if tok.gap else "") + tok.tex for tok in tail)
         if head and island and island[0].gap:
             prefix += " "
-        out.append((" " if lead_gap else "") + prefix + (f"${maths}$" if maths else "") + suffix)
+        ordinal = _ORDINAL_RE.fullmatch(maths)
+        if ordinal:  # "2nd", "3rd" with a raised ending is prose
+            body = ordinal.group(1) + ordinal.group(2)
+        else:
+            body = "$" + _ORDINAL_IN_MATHS_RE.sub(r"\\text{\1}", maths) + "$" if maths else ""
+        out.append((" " if lead_gap else "") + prefix + body + suffix)
         i = j
     return "".join(out).strip()
 

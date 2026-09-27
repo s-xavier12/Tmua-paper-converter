@@ -22,6 +22,11 @@ and root bars as separate lines. The converter rebuilds the maths from that geom
 | a big ∑ / ∫ with small text over and under it | `\sum_{k=1}^{10}` |
 | tall brackets | `\left( … \right)` |
 | maths fonts vs text fonts | `$…$` around the maths only |
+| typed powers like n² or x₁ (no equation editor) | `n^2`, `x_1` |
+| units and ordinals: cm², 2nd | `cm$^2$`, `2nd`, kept as text |
+| underlined words | plain text (never mistaken for a fraction) |
+
+Empty or pointless brackets (`x^{}`, `{{…}}`, `x^{2}`) are removed before the file is written.
 
 Diagrams, graphs, tables and graph-option panels are cropped from the page itself, never redrawn.
 Each crop is snapped to the drawing, keeps its labels, never takes in question text, and is trimmed
