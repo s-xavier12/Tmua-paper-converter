@@ -6,10 +6,12 @@ what the simulator will see.
 
 from __future__ import annotations
 
+import functools
 import io
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
 from PIL import Image as PILImage
@@ -23,6 +25,19 @@ FORBIDDEN_KEYS = {
     "correctanswer", "correct_answer", "answer", "answers", "answerkey", "answer_key", "correct", "solution",
     "solutions", "explanation", "explanations", "marks", "mark", "reasoning", "workedsolution", "hint", "hints",
 }
+
+KATEX_JS = Path(__file__).parent / "web" / "static" / "vendor" / "katex" / "katex.min.js"
+
+
+@functools.lru_cache(maxsize=1)
+def katex_commands() -> frozenset[str]:
+    """Every command the bundled KaTeX defines, read from its own source (empty if it is missing)."""
+    try:
+        js = KATEX_JS.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    return frozenset(re.findall(r'"\\\\([A-Za-z]+)"', js))
+
 
 # Words that are never English, so seeing them bare means a lost backslash.
 BARE_ERROR_WORDS = ("frac dfrac tfrac sqrt binom dbinom infty times cdot leq geq neq mathrm lfloor rfloor lceil "
@@ -168,6 +183,12 @@ def check_string(report: ValidationReport, s: Any, q: int | None, fld: str, allo
                 report.add("warning", "text-braces", f"unbalanced braces in prose: {why}", q, fld)
             continue
         math = seg.content
+        supported = katex_commands()
+        if supported:
+            for cmd in latex.commands(math):
+                if cmd.backslashes == 1 and cmd.name.isalpha() and cmd.name not in supported:
+                    report.add("error", "katex-unsupported",
+                               f"'\\{cmd.name}' is not a KaTeX command - the simulator will show it in red", q, fld)
         ok, why = latex.brace_balance(math)
         if not ok:
             report.add("error", "brace-balance", f"unbalanced braces in maths '{_short(math)}': {why}", q, fld)

@@ -27,6 +27,7 @@ MODEL_LONG_EDGE = 2576  # max image long edge used by current Claude vision mode
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
 # Fonts LaTeX's picture mode uses to draw slanted lines and circles: graphics, not text.
 _DRAWING_FONT_RE = re.compile(r"^(LINE|LCIRCLE|LCIRCLEW)\d*", re.I)
+_OPTION_LABEL_RE = re.compile(r"^\(?[A-H][.)]?(?:\s|$)")
 _NUMBER_ONLY_RE = re.compile(r"[\-–—\s]*\(?\d{1,3}[.):]?[\-–—\s]*")
 # Lines that start with a question marker: never running headers, even when a
 # question happens to start at the same height on many pages.
@@ -434,6 +435,8 @@ class PdfDocument:
             for ln in self.lines(p):
                 if _NUMBER_ONLY_RE.fullmatch(ln.text) or _QUESTION_START_RE.match(ln.text):
                     continue  # numbers are handled by position (question markers vs page numbers)
+                if _OPTION_LABEL_RE.match(ln.text):
+                    continue  # answer letters often sit at the same height on every page
                 key = (re.sub(r"\d+", "#", ln.text.lower()), round(ln.box.y0 / 6))
                 if key not in seen:
                     seen.add(key)
@@ -542,9 +545,13 @@ class PdfDocument:
         if self._anchors is not None:
             return self._anchors
         cands: list[tuple[Anchor, bool]] = []
+        edge_numbers: dict[int, list[Anchor]] = {}  # bare numbers printed first or last on a page
         for p in range(1, self.page_count + 1):
             pw = self.page_box(p).width
             page_lines = self.content_lines(p)
+            if page_lines:
+                top = min(page_lines, key=lambda ln: ln.box.y0)
+                bottom = max(page_lines, key=lambda ln: ln.box.y1)
             for ln in page_lines:
                 if ln.first_span_box.x0 > pw * 0.25:
                     continue
@@ -563,7 +570,11 @@ class PdfDocument:
                     m = re.match(r"(?:Question|Q)\s*(\d{1,3})(?![\d])[.):]?", ln.text)
                 if not m:
                     continue
-                cands.append((Anchor(int(m.group(1)), p, box), ln.first_span_bold))
+                anchor = Anchor(int(m.group(1)), p, box)
+                cands.append((anchor, ln.first_span_bold))
+                if (ln is top or ln is bottom) and re.fullmatch(r"\d{1,3}", ln.text.strip()):
+                    edge_numbers.setdefault(p, []).append(anchor)
+        cands = self._drop_page_numbers(cands, edge_numbers)
         best: tuple[tuple[int, int, float], dict[int, Anchor]] | None = None
         for col in sorted({round(a.box.x0 / 8) for a, _ in cands}):
             column = sorted((c for c in cands if abs(round(c[0].box.x0 / 8) - col) <= 1),
@@ -579,6 +590,28 @@ class PdfDocument:
                 best = (score, run)
         self._anchors = best[1] if best else {}
         return self._anchors
+
+    @staticmethod
+    def _drop_page_numbers(cands: list[tuple[Anchor, bool]], edge_numbers: dict[int, list[Anchor]]
+                           ) -> list[tuple[Anchor, bool]]:
+        """Remove page numbers printed in the question-number column.
+
+        A page number sits first or last on its page and goes up by one per page (number - page is the
+        same on every page).  It only matters on pages that also carry a question number, where it
+        could be taken for one (question 10 on page 10), so a series is dropped only when most of its
+        pages have another number candidate as well."""
+        offsets = Counter(a.number - p for p, lst in edge_numbers.items() for a in lst)
+        if not offsets:
+            return cands
+        offset, count = offsets.most_common(1)[0]
+        if count < 3:
+            return cands
+        series = {id(a) for p, lst in edge_numbers.items() for a in lst if a.number - p == offset}
+        pages = {p for p, lst in edge_numbers.items() if any(id(a) in series for a in lst)}
+        shared = sum(1 for p in pages if sum(1 for a, _ in cands if a.page == p and id(a) not in series))
+        if shared < 0.5 * len(pages):
+            return cands  # one question per page with no page numbers: these are the questions
+        return [c for c in cands if id(c[0]) not in series]
 
     def question_regions(self, number: int) -> list[tuple[int, Box]]:
         """Best-effort regions (page, box in pt) occupied by question *number*.

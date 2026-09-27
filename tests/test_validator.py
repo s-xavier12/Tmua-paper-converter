@@ -143,3 +143,11 @@ def test_whitespace_heavy_image_warns():
     d["questions"][1]["images"][0]["src"] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
     r = validate_paper(d)
     assert "image-whitespace" in {i.code for i in r.warnings}
+
+
+def test_command_katex_cannot_draw_is_an_error():
+    from tmua_converter.validator import ValidationReport, check_string
+
+    r = ValidationReport()
+    check_string(r, "Let $\\lcm(a, b)$ and $\\operatorname{hcf}(a, b)$ be given.", 1, "stem")
+    assert [i.code for i in r.errors] == ["katex-unsupported"]

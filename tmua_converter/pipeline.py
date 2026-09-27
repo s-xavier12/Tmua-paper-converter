@@ -478,6 +478,7 @@ class Converter:
                 kept.append(ln)
             segments[found[-1]] = kept
 
+        segments[None] = self._drop_own_number(segments[None], n, S, q)
         q.stem = ml.lines_to_text(segments[None], problems, column=col)
         opts = [{"label": lab, "content": _numeric_as_maths(ml.lines_to_text(segments[lab], problems))}
                 for lab in found]
@@ -515,6 +516,26 @@ class Converter:
         q.history.append(f"pass 1: rebuilt from {len(glyphs)} characters and {sum(r.used for r in rules)} "
                          f"fraction/root bars on page(s) {pages}")
         return q
+
+    def _drop_own_number(self, lines: list[ml.Line], n: int, S: float, q: QuestionState) -> list[ml.Line]:
+        """The question's own number printed a second time at the start (a copy in a box, a page
+        number equal to it, a numbered heading): it belongs to the simulator, not the question text."""
+        if not lines:
+            return lines
+        first = lines[0]
+        its = sorted(first.items, key=lambda i: i.x0)
+        k, text = 0, ""
+        while k < len(its) and isinstance(its[k], ml.Glyph) and (k == 0 or its[k].x0 - its[k - 1].x1 < 0.4 * S):
+            text += its[k].ch
+            k += 1
+        if not re.fullmatch(rf"(?:Q|Question)?{n}[.):]?", text):
+            return lines
+        rest = its[k:]
+        if rest and rest[0].x0 - its[k - 1].x1 < 0.4 * S:
+            return lines
+        self._ignored.update(id(g) for it in its[:k] for g in it.glyphs())
+        q.history.append(f"removed the question number {n} printed again at the start of the question")
+        return ([_subline(rest, first)] if rest else []) + lines[1:]
 
     def _page_anchors(self) -> dict:
         """No question numbers: treat each page that has answer options as one question."""

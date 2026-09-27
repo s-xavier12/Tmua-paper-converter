@@ -63,3 +63,53 @@ def test_word_typed_question(tmp_path):
     assert [o.content for o in q.options] == ["$n^2 + n$ is even", "$n^3 - n$ is divisible by 3", "$2^n > n$",
                                               "$n(n + 1)(n + 2)$ is odd", "none of the above"]
     assert not q.needsReview
+
+
+def test_hcf_lcm_are_katex_safe(tmp_path):
+    p = Page()
+    y = 60
+    p.t(50, y, "1", "Bold")
+    x = p.t(70, y, "Let hcf(")
+    x = p.t(x, y, "a", "Italic")
+    x = p.t(x, y, ", ")
+    x = p.t(x, y, "b", "Italic")
+    x = p.t(x, y, ") and lcm(")
+    x = p.t(x, y, "a", "Italic")
+    x = p.t(x, y, ", ")
+    x = p.t(x, y, "b", "Italic")
+    p.t(x, y, ") be as usual.")
+    for i in range(4):
+        p.t(70, y + 30 + 18 * i, "ABCD"[i], "Bold")
+        p.t(95, y + 30 + 18 * i, str(i + 2))
+    q = convert(tmp_path, p)[0]
+    assert q.stem == "Let $\\operatorname{hcf}(a, b)$ and $\\operatorname{lcm}(a, b)$ be as usual."
+    assert not q.needsReview
+
+
+def _numbered_pages(p_number_x, twice=False):
+    """Three questions, one per page; each page number equals its question number."""
+    doc = Page()
+    doc.page.insert_text((50, 80), "Mock Paper", fontsize=20)
+    stems = ["For positive integers a and b, find the pairs.", "Evaluate the sum of the series given here.",
+             "Which value of x makes the product largest?"]
+    for n in range(1, 4):
+        doc.page = doc.doc.new_page()
+        if p_number_x is not None:
+            doc.t(p_number_x, 40, str(n))
+        doc.t(50, 80, str(n), "Bold", 12)
+        if twice:
+            doc.t(80, 80, str(n), "Bold", 14)  # the number printed again, e.g. in a box
+        doc.t(80, 100 if twice else 80, stems[n - 1])
+        for i in range(4):
+            doc.t(80, 130 + 20 * i, "ABCD"[i], "Bold")
+            doc.t(105, 130 + 20 * i, str(n * 10 + i))
+    return doc, stems
+
+
+@pytest.mark.parametrize("p_number_x,twice", [(50, False), (295, False), (None, True)])
+def test_question_number_is_not_in_the_text(tmp_path, p_number_x, twice):
+    doc, stems = _numbered_pages(p_number_x, twice)
+    qs = convert(tmp_path, doc)
+    assert [q.stem for q in qs] == stems
+    assert [[o.content for o in q.options] for q in qs] == [[f"${n * 10 + i}$" for i in range(4)] for n in (1, 2, 3)]
+    assert not any(q.needsReview for q in qs)

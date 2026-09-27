@@ -56,7 +56,13 @@ UNI_SUB = dict(zip("₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎", "0123456789+
 PUNCT = set(",.;:?!()[]'\"‘’“”/")
 BIG_OPS = {"∑": "\\sum", "∏": "\\prod", "∫": "\\int", "∮": "\\oint", "⋃": "\\bigcup", "⋂": "\\bigcap"}
 FUNCTIONS = ("arcsin arccos arctan sinh cosh tanh sin cos tan sec cosec csc cot log ln exp lim max min det "
-             "gcd lcm deg arg").split()
+             "gcd lcm hcf deg arg").split()
+# KaTeX has no \lcm or \hcf: these are written \operatorname{lcm}, which it draws the same way
+OPERATORNAME_ONLY = {"lcm", "hcf"}
+
+
+def function_tex(word: str) -> str:
+    return "\\operatorname{" + word + "}" if word in OPERATORNAME_ONLY else "\\" + word
 RADICAL = "√"
 
 # Computer Modern extension font (LaTeX's big delimiters, operators, radicals),
@@ -761,7 +767,7 @@ def math_tex(nodes: list[Node], problems: list[str]) -> str:
         # function names written in upright letters: sin, cos, log, ...
         word, consumed = _function_word(nodes, idx)
         if word:
-            tex = "\\" + word
+            tex = function_tex(word)
             last = nodes[idx + consumed - 1]
             tex += _scripts(last, problems)
             parts.append((tex, gap))
@@ -916,7 +922,7 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
             if word:  # sin, cos, log set in a maths font (Word's Cambria Math)
                 last = nodes[i + consumed - 1]
                 gap = gap or prev_n is not None and isinstance(prev_n.item, BigOp)
-                tokens.append(Token("math", "\\" + word + _scripts(last, problems), gap, node))
+                tokens.append(Token("math", function_tex(word) + _scripts(last, problems), gap, node))
                 i += consumed
                 continue
         if kind == "text":
