@@ -155,7 +155,15 @@ def read_metadata(doc: PdfDocument, filename: str) -> dict:
     title = ""
     if lines:
         biggest = max(ln.size for ln in lines)
-        top = [ln.text.strip() for ln in lines if ln.size >= 0.8 * biggest][:3]
+        top = []
+        for ln in lines:
+            text = ln.text.strip()
+            if re.fullmatch(r"[\d\s]*(?:hours?|hrs?|minutes?|mins?)\b.*", text, re.I) \
+                    or re.match(r"(?:time allowed|instructions|please read)\b", text, re.I):
+                break  # the title ends where the timing and instructions start
+            if ln.size >= 0.8 * biggest:
+                top.append(text)
+        top = top[:3]
         title = re.sub(r"\s+", " ", " ".join(top)).strip()
     stem = re.sub(r"^\d{2}_", "", Path(filename).stem.replace(".source", ""))  # web uploads are numbered 01_, 02_
     stem = stem.replace("_", " ").replace("-", " ")
@@ -763,7 +771,12 @@ def _label_chain(lines: list, S: float) -> dict[tuple[int, int], tuple[str, int]
 def _numeric_as_maths(text: str) -> str:
     """An answer that is just a number is written as maths, like every other expression."""
     m = re.fullmatch(r"([-−]?)\s*(\d+(?:\.\d+)?)", text.strip())
-    return f"${'-' if m.group(1) else ''}{m.group(2)}$" if m else text
+    if m:
+        return f"${'-' if m.group(1) else ''}{m.group(2)}$"
+    t = text.strip().replace("−", "-")
+    if re.fullmatch(r"-?\d+!", t) or re.fullmatch(r"\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)", t):
+        return "$" + re.sub(r",\s*", ", ", t) + "$"  # 10!, (1, 5)
+    return text
 
 
 def _subline(items: list[ml.Item], ln: ml.Line) -> ml.Line:

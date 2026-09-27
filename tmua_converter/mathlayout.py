@@ -115,6 +115,7 @@ class Glyph(Item):
     known: bool = True
     ocr: bool = False  # read from a picture by OCR
     big: bool = False  # a tall bracket (\\left / \\right)
+    space_before: bool = False  # the PDF has a space character just before this one
 
     def glyphs(self) -> list["Glyph"]:
         return [self]
@@ -264,6 +265,7 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
     *raw* is the page's rawdict when it was assembled elsewhere (e.g. with OCR text).
     """
     out: list[Glyph] = []
+    spaced = False
     dl = None
     raw = raw if raw is not None else page.get_text("rawdict")
     for block in raw.get("blocks", []):
@@ -280,6 +282,8 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                 math_font = not ocr and bool(MATH_FONT_RE.search(font))
                 for ch in span.get("chars", []):
                     c = ch.get("c", "")
+                    if c.isspace():
+                        spaced = True
                     if not c or c.isspace() or c in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
                         continue
                     norm, known = normalise_char(c, font)
@@ -301,7 +305,8 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                     if cmex and c in _CMEX_DEPTH and norm != RADICAL:
                         base = (y0 + y1) / 2 + 0.25 * size  # big symbols sit centred on the maths axis
                     out.append(Glyph(x0, y0, x1, y1, base, size, norm, c, font, bold, italic,
-                                     math_font, page_no, known, ocr))
+                                     math_font, page_no, known, ocr, space_before=spaced))
+                    spaced = False
     return out
 
 
@@ -406,6 +411,9 @@ class Builder:
         for o in self.items:
             if o is it or not isinstance(o, Glyph):
                 continue
+            if any(r.x0 - 1 <= o.cx <= r.x1 + 1 and (r.x0, r.x1) != (x0, x1) and abs(o.cy - r.y) < 1.2 * self.S
+                   for r in self.rules):
+                continue  # the numerator/denominator of a neighbouring fraction, e.g. (2/5, 19/5)
             if abs(o.base - it.base) < tol and abs(o.size - it.size) < 0.5:
                 if x0 - reach <= o.cx < x0 - 1.0 or x1 + 1.0 < o.cx <= x1 + reach:
                     return True
@@ -440,7 +448,9 @@ class Builder:
                 overlaps = it.y1 > gy0 - 0.1 * ref and it.y0 < gy1 + 0.1 * ref
                 small = it.size < 0.86 * ref
                 same_base = any(abs(it.base - b) < 0.3 * ref for b in bases)
-                if overlaps and (small or same_base) and not self._same_line_outside(it, rule.x0, rule.x1):
+                within = rule.x0 - 0.5 <= it.x0 and it.x1 <= rule.x1 + 0.5  # e.g. the 2 of tan^2 x
+                if overlaps and (small or same_base) and (small and within
+                                                          or not self._same_line_outside(it, rule.x0, rule.x1)):
                     group.append(it)
                     grew = True
         return group
@@ -530,7 +540,16 @@ class Builder:
                      and it.cy < op.cy - 0.25 * h and it.y1 >= op.y0 - 1.1 * S]
             lower = [it for it in self.items if it is not op and self._in_x(it, op.x0, op.x1, 2) and small(it)
                      and it.cy > op.cy + 0.25 * h and it.y0 <= op.y1 + 1.1 * S]
-            # (integral limits set to the right are scripts, handled by the line layout)
+            # integral limits set to the right are scripts, handled by the line layout: a limit that
+            # carries on past the sign's right edge ("−" of "−√2") is not a limit under the sign
+            def runs_right(group: list[Item]) -> bool:
+                return any(o not in group and o is not op and o.x0 > op.x1 - 0.5 and small(o)
+                           and any(abs(o.base - g.base) < 0.2 * S and 0 <= o.x0 - g.x1 < 0.3 * S for g in group)
+                           for o in self.items)
+            if upper and runs_right(upper):
+                upper = []
+            if lower and runs_right(lower):
+                lower = []
             # a big (display) operator is taller than the text around it; centre it on the maths axis
             base = op.cy + 0.25 * S if op.y1 - op.y0 > 1.2 * S else op.base
             items = [op] + upper + lower
@@ -591,8 +610,10 @@ def hlist(items: list[Item], problems: list[str]) -> list[Node]:
             nodes.append(Node(it))
             i += 1
             continue
-        # collect a run of script items in this direction
+        # collect a run of script items in this direction; the other script of the same base
+        # (a limit above while collecting the one below) may sit in between
         run = [it]
+        other: list[Item] = []
         j = i + 1
         while j < len(items):
             nx = items[j]
@@ -600,10 +621,20 @@ def hlist(items: list[Item], problems: list[str]) -> list[Node]:
                 break
             nd = "sup" if nx.base < baseline - 0.18 * base_size else "sub" if nx.base > baseline + 0.08 * base_size \
                 else None
+            if nd is not None and nd != direction:
+                other.append(nx)
+                j += 1
+                continue
             if nd != direction or nx.x0 - run[-1].x1 > 0.45 * base_size:
                 break
             run.append(nx)
             j += 1
+        if other:  # put the skipped items back so they are handled next
+            rest = [x for x in items[i + 1:j] if x in other]
+            items = items[:i + 1] + rest + [x for x in items[i + 1:j] if x not in other and x not in run] + items[j:]
+            j = i + 1
+            items = items[:i] + [x for x in items[i:] if x not in run]
+            j = i
         target = nodes[-1]
         slot = target.sup if direction == "sup" else target.sub
         if slot:
@@ -738,6 +769,12 @@ def math_tex(nodes: list[Node], problems: list[str]) -> str:
             idx += consumed
             continue
         tex = _node_core(node, problems) + _scripts(node, problems)
+        if isinstance(prev_node, Node) and isinstance(prev_node.item, BigOp):
+            gap = True  # \int_0^a 6x, not \int_0^a6x
+        nxt = nodes[idx + 1].item if idx + 1 < len(nodes) else None
+        if isinstance(it, Glyph) and it.ch == "d" and it.math_font and not _math_italic_char(it) \
+                and isinstance(nxt, Glyph) and _math_italic_char(nxt) and prev_node is not None:
+            tex, gap = "\\,d", False  # Word's upright differential d: "12\,dx"
         parts.append((tex, gap))
         prev_node = node
         idx += 1
@@ -751,6 +788,8 @@ def _function_word(nodes: list[Node], i: int) -> tuple[str | None, int]:
         it = nodes[j].item
         if not (isinstance(it, Glyph) and it.ch.isalpha() and it.ch.isascii() and not (it.italic and it.math_font)):
             break
+        if _math_italic_char(it):
+            break  # Word writes variables as maths-italic letters (𝑥) and sin/cos upright: "sin𝑥"
         if j > i and it.x0 - nodes[j - 1].item.x1 > 0.17 * it.size:
             break
         if j > i and (nodes[j - 1].sup or nodes[j - 1].sub):
@@ -760,7 +799,8 @@ def _function_word(nodes: list[Node], i: int) -> tuple[str | None, int]:
     if letters in FUNCTIONS:
         if i > 0:
             p = nodes[i - 1].item
-            if isinstance(p, Glyph) and p.ch.isalpha() and nodes[i].item.x0 - p.x1 < 0.17 * p.size:
+            if isinstance(p, Glyph) and p.ch.isalpha() and nodes[i].item.x0 - p.x1 < 0.17 * p.size \
+                    and not getattr(nodes[i].item, "space_before", False):
                 return None, 0
         return letters, len(letters)
     return None, 0
@@ -861,8 +901,24 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
         node = nodes[i]
         it = node.item
         prev_n = nodes[i - 1] if i else None
-        gap = prev_n is not None and it.x0 - node_right(prev_n) > 0.17 * max(it.size, prev_n.item.size)
+        gap = prev_n is not None and (it.x0 - node_right(prev_n) > 0.17 * max(it.size, prev_n.item.size)
+                                      or getattr(it, "space_before", False) and it.math_font)
         kind = classify_node(node)
+        words = _maths_font_prose(nodes, i)
+        if words:  # a sentence typed inside an equation: "You may use the fact that"
+            for k, (word, a, b) in enumerate(words):
+                wgap = gap if k == 0 else True
+                tokens.append(Token("text", word, wgap, nodes[a]))
+            i = words[-1][2]
+            continue
+        if kind == "math" and isinstance(it, Glyph) and it.ch.isalpha():
+            word, consumed = _function_word(nodes, i)
+            if word:  # sin, cos, log set in a maths font (Word's Cambria Math)
+                last = nodes[i + consumed - 1]
+                gap = gap or prev_n is not None and isinstance(prev_n.item, BigOp)
+                tokens.append(Token("math", "\\" + word + _scripts(last, problems), gap, node))
+                i += consumed
+                continue
         if kind == "text":
             # a whole word in a text font (letters, apostrophes, hyphens)
             j = i
@@ -899,6 +955,16 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
             kind = "math"
         if kind == "neutral" and isinstance(it, Glyph) and it.ch == "-" and not it.math_font:
             tex = "-"
+            nxt = nodes[i + 1] if i + 1 < len(nodes) else None
+            if nxt is not None and isinstance(nxt.item, Glyph) and nxt.item.ch.isalpha() and not nxt.item.math_font \
+                    and nxt.item.x0 - it.x1 < 0.17 * it.size:
+                kind = "text"  # the hyphen of "y-axis"
+        if prev_n is not None and isinstance(prev_n.item, BigOp):
+            gap = True  # \int_0^a 6x, not \int_0^a6x
+        nxt = nodes[i + 1].item if i + 1 < len(nodes) else None
+        if isinstance(it, Glyph) and it.ch == "d" and it.math_font and not _math_italic_char(it) \
+                and isinstance(nxt, Glyph) and _math_italic_char(nxt) and prev_n is not None:
+            tex, gap, kind = "\\,d", False, "math"  # Word's upright differential d: "12\,dx"
         tokens.append(Token(kind, tex, gap, node))
         i += 1
     return _upright_variables(tokens)
@@ -917,8 +983,7 @@ def _upright_variables(tokens: list[Token]) -> list[Token]:
             return True
         if t.kind != "neutral":
             return False
-        return (t.tex[-1:] if left else t.tex[:1]) in _OPERATOR_CHARS or (not left and t.tex == ")") \
-            or (left and t.tex == "(")
+        return (t.tex[-1:] if left else t.tex[:1]) in _OPERATOR_CHARS - ({"("} if left else set())
     changed = True
     while changed:
         changed = False
@@ -946,7 +1011,8 @@ def _split_islands(tokens: list[Token]) -> list[Token]:
         opens = t.tex.count("(") + t.tex.count("[")
         closes = t.tex.count(")") + t.tex.count("]")
         depth = max(0, depth + opens - closes)
-        if t.kind == "neutral" and t.tex in (",", ";") and depth == 0 and k + 1 < len(tokens) and tokens[k + 1].gap:
+        if t.kind == "neutral" and t.tex in (",", ";", ".") and depth == 0 and k + 1 < len(tokens) \
+                and tokens[k + 1].gap and not (t.tex == "." and k + 1 < len(tokens) and tokens[k + 1].tex == "."):
             t.kind = "sep"
     return tokens
 
@@ -970,6 +1036,8 @@ def _italic_maths_word(word: str, word_nodes: list[Node], nodes: list[Node], i: 
         return True
     if word.lower() in _EMPHASIS or not word.isalpha():
         return False
+    if _italic_word_len(nodes, j, 1) >= 3 or _italic_word_len(nodes, i - 1, -1) >= 3:
+        return False  # part of an italic sentence: "You should not ..."
     if len(word) <= 4:
         return True
 
@@ -1032,7 +1100,7 @@ def tokens_to_text(tokens: list[Token]) -> str:
         lead_gap = (head[0].gap if head else island[0].gap if island else False) and bool(out)
         prefix = "".join(tok.tex for tok in head)
         maths = tidy_math(_pair_big_delimiters(_join([(tok.tex, tok.gap and k > 0) for k, tok in enumerate(island)])))
-        suffix = "".join((" " if tok.gap else "") + tok.tex for tok in tail)
+        suffix = "".join((" " if tok.gap and tok.tex not in ")]" else "") + tok.tex for tok in tail)
         if head and island and island[0].gap:
             prefix += " "
         ordinal = _ORDINAL_RE.fullmatch(maths)
@@ -1064,7 +1132,7 @@ def build_lines(items: list[Item], page_of: dict[int, int], S: float) -> list[Li
     pages = sorted({page_of.get(id(i), 0) for i in items})
     for page in pages:
         its = [i for i in items if page_of.get(id(i), 0) == page]
-        primary = [i for i in its if i.size >= 0.86 * S or not isinstance(i, Glyph)]
+        primary = [i for i in its if i.size >= 0.86 * S or not isinstance(i, Glyph) and not _script_sized(i, S)]
         secondary = [i for i in its if i not in primary]
         primary.sort(key=lambda i: i.base)
         groups: list[list[Item]] = []
@@ -1155,3 +1223,60 @@ def lines_to_text(lines: list[Line], problems: list[str], column: tuple[float, f
     if cur:
         paras.append(cur)
     return "\n\n".join(p.strip() for p in paras if p.strip())
+
+
+def _script_sized(it: Item, S: float) -> bool:
+    """A small root or fraction set as a limit or exponent (the limit sqrt 2 of an integral, x^{3/2})."""
+    return isinstance(it, (Root, Frac)) and all(g.size < 0.86 * S for g in it.glyphs())
+
+
+def _math_italic_char(g: Glyph) -> bool:
+    """A Unicode maths-italic letter such as U+1D465 (italic x), as Word's equation editor writes variables."""
+    raw = g.raw or ""
+    return len(raw) == 1 and 0x1D400 <= ord(raw) <= 0x1D7FF and "ITALIC" in unicodedata.name(raw, "")
+
+
+def _maths_font_prose(nodes: list[Node], i: int) -> list[tuple[str, int, int]]:
+    """Words of a sentence set in a maths font, starting at nodes[i]: two or more letter-only words
+    of two or more letters, one of them a real-looking word (3+ letters with a vowel).
+    Returns (word, start, end) per word, or [] when this is maths."""
+    words: list[tuple[str, int, int]] = []
+    j = i
+    while j < len(nodes):
+        a = j
+        word = ""
+        while j < len(nodes):
+            g = nodes[j].item
+            if not (isinstance(g, Glyph) and g.math_font and g.ch.isalpha() and g.ch.isascii()) \
+                    or nodes[j].sup or nodes[j].sub:
+                break
+            if j > a and (g.x0 - nodes[j - 1].item.x1 > 0.17 * g.size or g.space_before):
+                break
+            word += g.ch
+            j += 1
+        if len(word) < 2 or word in FUNCTIONS:
+            j = a
+            break
+        words.append((word, a, j))
+    if len(words) >= 2 and any(len(w) >= 3 and set(w.lower()) & set("aeiouy") for w, _, _ in words):
+        return words
+    return []
+
+
+def _italic_word_len(nodes: list[Node], k: int, step: int) -> int:
+    """Length of the italic text-font word (with a lower-case letter) starting at nodes[k], reading in *step*."""
+    letters = ""
+    while 0 <= k < len(nodes):
+        n = nodes[k]
+        g = n.item
+        if not (isinstance(g, Glyph) and g.ch.isalpha() and g.italic and not g.math_font and not g.bold) \
+                or n.sup or n.sub:
+            break
+        if letters:
+            prev = nodes[k - step].item
+            gap = g.x0 - prev.x1 if step > 0 else prev.x0 - g.x1
+            if gap > 0.17 * g.size:
+                break
+        letters += g.ch
+        k += step
+    return len(letters) if any(c.islower() for c in letters) else 0
