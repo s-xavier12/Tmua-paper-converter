@@ -41,7 +41,7 @@ NUMBER_WORDS = {w: i for i, w in enumerate(
     "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
     "seventeen eighteen nineteen twenty".split())}
 NUMBER_WORDS.update({"thirty": 30, "forty": 40, "fifty": 50, "twenty-five": 25, "thirty-five": 35})
-LABELS = "ABCDEFGH"
+LABELS = "ABCDEFGHIJ"
 
 
 class ConversionError(RuntimeError):
@@ -239,7 +239,11 @@ class Converter:
                 self._renderer = try_start_renderer()
                 self._own_renderer = self._renderer is not None
                 if self._renderer is None:
-                    self.notes.append("KaTeX render check skipped (install playwright + Chromium to enable it).")
+                    from .katex_node import node_available
+
+                    self.notes.append("Every expression was checked with KaTeX (the simulator's renderer, via Node.js)."
+                                      if node_available() else
+                                      "KaTeX check skipped: install Node.js (or playwright + Chromium) to enable it.")
             return self._convert(pdf_path, Path(out_dir) if out_dir else pdf_path.parent)
         finally:
             if self._own_renderer and self._renderer is not None:
@@ -576,7 +580,7 @@ class Converter:
                     text = re.sub(r"^\s*\d{1,3}[.):]?(\s+|$)", "", text)
                 if not text.strip():
                     continue
-                m = re.match(r"^\(?([A-H])[.)]?(?:\s+(.*))?$", text)
+                m = re.match(r"^\(?([A-J])[.)]?(?:\s+(.*))?$", text)
                 if m and len(opts) < len(LABELS) and m.group(1) == LABELS[len(opts)]:
                     opts.append({"label": m.group(1), "content": (m.group(2) or "").strip()})
                 elif opts:
@@ -716,8 +720,9 @@ class Converter:
             q.history.append("pass 2: every letter and digit printed in the question is in the output exactly once")
 
     def _validate(self, data: dict, expected: int | None, meta: dict) -> ValidationReport:
-        katex_errors: dict[tuple[int, str], str] = {}
+        katex_errors: dict[tuple[int, str], str] | None = None  # None: the validator runs KaTeX in Node.js
         if self._renderer is not None:
+            katex_errors = {}
             for qd in data.get("questions", []):
                 try:
                     res = self._renderer.render(qd)

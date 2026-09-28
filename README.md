@@ -26,6 +26,9 @@ and root bars as separate lines. The converter rebuilds the maths from that geom
 | units and ordinals: cm², 2nd | `cm$^2$`, `2nd`, kept as text |
 | underlined words | plain text (never mistaken for a fraction) |
 
+PDFs whose text layer is broken (fractions and powers reading as Oriya or Malayalam letters, common in
+Word files re-saved by other programs) are repaired from the fonts embedded in the PDF.
+
 Empty or pointless brackets (`x^{}`, `{{…}}`, `x^{2}`) are removed before the file is written.
 
 Diagrams, graphs, tables and graph-option panels are cropped from the page itself, never redrawn.
@@ -80,7 +83,10 @@ It never gives up on a whole paper because of one odd question:
    - Linux: `sudo apt install tesseract-ocr`
 
    Digital PDFs don't need it.
-4. **Optional, KaTeX render check:** `pip install -e ".[render]"` then `playwright install chromium`.
+4. **KaTeX check:** if [Node.js](https://nodejs.org) is installed (it is in GitHub Codespaces), every
+   expression is rendered with the same KaTeX the simulator uses, and anything it can't draw is
+   reported. No browser needed. (A browser-based check is also available: `pip install -e ".[render]"`
+   then `playwright install chromium`.)
 
 ## Web app
 

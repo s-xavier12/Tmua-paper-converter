@@ -427,7 +427,28 @@ def page_rules(page) -> list[Rule]:
         if r.height <= 1.6 and r.width >= 2.0:
             if all(it[0] in ("l", "re", "qu") for it in items):
                 rules.append(Rule(float(r.x0), float(r.x1), float((r.y0 + r.y1) / 2)))
+            continue
+        if r.height > 40 or len(items) > 8:
+            continue  # a diagram, not a group of bars
+        if not all(it[0] == "re" or it[0] == "l" and abs(it[1].y - it[2].y) < 0.3 for it in items):
+            continue  # slanted strokes: a drawn root sign or a shape, handled elsewhere
+        # one drawing may hold several bars (Word draws a fraction bar and a root bar together)
+        for it in items:
+            if it[0] == "re":
+                b = it[1]
+            elif it[0] == "l":
+                b = pymupdf_rect(it[1], it[2])
+            else:
+                continue
+            if b.height <= 1.6 and b.width >= 2.0 and (it[0] == "re" or abs(it[1].y - it[2].y) < 0.3):
+                rules.append(Rule(float(b.x0), float(b.x1), float((b.y0 + b.y1) / 2)))
     return rules
+
+
+def pymupdf_rect(p1, p2):
+    import pymupdf
+
+    return pymupdf.Rect(min(p1.x, p2.x), min(p1.y, p2.y), max(p1.x, p2.x), max(p1.y, p2.y))
 
 
 # --------------------------------------------------------------------------- structure building
@@ -961,6 +982,12 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
                 tokens.append(Token("text", word, wgap, nodes[a]))
             i = words[-1][2]
             continue
+        word_end = _maths_font_word(nodes, i)
+        if word_end:  # one English word inside maths ("x base area x height"): upright text
+            word = "".join(n.item.ch for n in nodes[i:word_end])
+            tokens.append(Token("math", "\\text{" + word + "}", gap, node))
+            i = word_end
+            continue
         if kind == "math" and isinstance(it, Glyph) and it.ch.isalpha():
             word, consumed = _function_word(nodes, i)
             if word:  # sin, cos, log set in a maths font (Word's Cambria Math)
@@ -1001,7 +1028,7 @@ def line_tokens(nodes: list[Node], problems: list[str]) -> list[Token]:
         tex = math_tex([node], problems) if kind == "math" else glyph_tex(it, problems) if isinstance(it, Glyph) \
             else math_tex([node], problems)
         if isinstance(it, Glyph) and it.ch in "()[]|" and (it.big or it.y1 - it.y0 > 1.7 * it.size):
-            tex = "\x00big" + it.ch
+            tex = "\x00big" + it.ch + _scripts(node, problems)  # keep a power on the bracket: \right)^2
             kind = "math"
         if kind == "neutral" and isinstance(it, Glyph) and it.ch == "-" and not it.math_font:
             tex = "-"
@@ -1164,7 +1191,9 @@ def tokens_to_text(tokens: list[Token]) -> str:
 
 
 # --------------------------------------------------------------------------- lines and paragraphs
-_STATEMENT_RE = re.compile(r"^(?:I{1,3}|IV|VI{0,3}|\((?:[a-h]|i{1,3}|iv|vi{0,3})\)|(?:[a-h]|i{1,3}|iv)\))(?=\s)")
+# a line starting a numbered statement: I  II.  (iii)  b)  1.  2)  P:
+_STATEMENT_RE = re.compile(r"^(?:(?:I{1,3}|IV|VI{0,3}|IX|X)\.?|\((?:[a-h]|i{1,3}|iv|vi{0,3}|\d{1,2})\)"
+                           r"|(?:[a-h]|i{1,3}|iv)\)|\d{1,2}[.)]|[PQRS]:)(?=\s)")
 @dataclass(eq=False)
 class Line:
     items: list[Item]
@@ -1238,25 +1267,34 @@ def lines_to_text(lines: list[Line], problems: list[str], column: tuple[float, f
             while core and core[-1].kind == "neutral" and core[-1].tex in (",", ".", ";"):
                 trail = core.pop().tex + trail
             tex = tidy_math(_pair_big_delimiters(_join([(t.tex, t.gap and k > 0) for k, t in enumerate(core)])))
-            rendered.append((ln, f"$${tex}{trail}$$", True))
+            rendered.append((ln, f"$${tex}{trail}$$", True, f"${tex}${trail}"))
         else:
-            rendered.append((ln, tokens_to_text(toks), False))
+            text = tokens_to_text(toks)
+            rendered.append((ln, text, False, text))
     gaps = [b[0].y0 - a[0].y1 for a, b in zip(rendered, rendered[1:]) if b[0].page == a[0].page
             and not a[2] and not b[2]]
     typical = statistics.median(gaps) if gaps else 0.3 * S
     paras: list[str] = []
     cur = ""
     para_start = ""
+    para_x0 = 0.0
     prev = None
-    for ln, text, display in rendered:
+    for ln, text, display, inline in rendered:
         if not text:
+            continue
+        if prev is not None and _STATEMENT_RE.match(para_start) and not _STATEMENT_RE.match(text) \
+                and ln.page == prev[0].page and ln.y0 - prev[0].y1 <= 1.0 * S and ln.x0 > para_x0 + 0.8 * S:
+            # the wrapped second line of a numbered statement ("I.  ... is a root of / x^b - 1 = 0")
+            cur = cur + " " + inline
+            prev = (ln, inline, False)
             continue
         new_para = prev is None or display or prev[2]
         if prev is not None and not new_para:
             gap = ln.y0 - prev[0].y1
             if ln.page != prev[0].page:
                 gap = typical
-            if gap > max(0.7 * S, typical + 0.45 * S) or ln.x0 > prev[0].x0 + 0.8 * S:
+            # extra space than usual, or a blank line's worth even when every line is spaced out
+            if gap > min(max(0.7 * S, typical + 0.45 * S), 1.0 * S) or ln.x0 > prev[0].x0 + 0.8 * S:
                 new_para = True  # extra space, or an indented line (new paragraph / statement)
             if _STATEMENT_RE.match(text):
                 new_para = True
@@ -1267,6 +1305,7 @@ def lines_to_text(lines: list[Line], problems: list[str], column: tuple[float, f
                 paras.append(cur)
             cur = text
             para_start = text
+            para_x0 = ln.x0
         else:
             cur = cur + ("" if cur.endswith("-") else " ") + text
         prev = (ln, text, display)
@@ -1330,3 +1369,26 @@ def _italic_word_len(nodes: list[Node], k: int, step: int) -> int:
         letters += g.ch
         k += step
     return len(letters) if any(c.islower() for c in letters) else 0
+
+
+def _maths_font_word(nodes: list[Node], i: int) -> int:
+    """End index of a lower-case English-looking word of 5+ letters set in a maths font at nodes[i]
+    (products of single-letter variables are never that long in a TMUA paper), else 0."""
+    if i and isinstance(nodes[i - 1].item, Glyph) and nodes[i - 1].item.ch.isalpha() \
+            and nodes[i].item.x0 - nodes[i - 1].item.x1 < 0.17 * nodes[i].item.size \
+            and not getattr(nodes[i].item, "space_before", False):
+        return 0
+    j = i
+    while j < len(nodes):
+        g = nodes[j].item
+        if not (isinstance(g, Glyph) and g.math_font and g.ch.isascii() and g.ch.islower()) \
+                or nodes[j].sup or nodes[j].sub:
+            break
+        if j > i and (g.x0 - nodes[j - 1].item.x1 > 0.17 * g.size or g.space_before):
+            break
+        j += 1
+    word = "".join(n.item.ch for n in nodes[i:j])
+    if len(word) >= 5 and word not in FUNCTIONS and re.search(r"[aeiouy]", word) \
+            and re.search(r"[aeiou]", word[1:-1]):
+        return j
+    return 0

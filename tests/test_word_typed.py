@@ -153,3 +153,20 @@ def test_broken_unicode_is_repaired_from_the_font(tmp_path):
     q = convert_pdf(tmp_path / "p.pdf", ConvertOptions(render_check=False), tmp_path).paper.questions[0]
     assert q.stem == "Work out $12 + 34$ and $56 + 78$."
     assert [o.content for o in q.options] == ["$90$", "$91$", "$92$", "$93$"]
+
+
+def test_statements_on_their_own_lines_and_powers_near_the_top(tmp_path):
+    p = Page()
+    y = 50  # the first line sits high on the page, in the band where page numbers live
+    p.t(50, y, "1", "Bold")
+    x = p.t(70, y, "Expand (1 + x)")
+    p.t(x, y - 5, "19", size=7.3)  # a power set on its own, like Word does
+    for k, s in enumerate(["I. the first statement is here", "II. the second statement is here",
+                           "III. the third statement is here"]):
+        p.t(70, y + 18 * (k + 1), s)
+    for i in range(3):
+        p.t(70, y + 90 + 18 * i, "ABC"[i], "Bold")
+        p.t(95, y + 90 + 18 * i, ["I only", "II only", "III only"][i])
+    q = convert(tmp_path, p)[0]
+    assert q.stem == ("Expand $(1 + x)^{19}$\n\nI. the first statement is here\n\nII. the second statement is here"
+                      "\n\nIII. the third statement is here")

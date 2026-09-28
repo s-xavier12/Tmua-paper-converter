@@ -17,12 +17,21 @@ for _k, _c in enumerate("0123456789+−"):
     _CAMBRIA[2868 + _k] = _c   # script size (fractions, exponents)
     _CAMBRIA[3116 + _k] = _c   # scriptscript size (exponents of exponents)
 for _k in range(26):
-    _CAMBRIA[3028 + _k] = chr(ord("a") + _k)   # script-size italic letters
-    _CAMBRIA[3276 + _k] = chr(ord("a") + _k)   # scriptscript-size italic letters
+    # script / scriptscript-size italic letters, as maths italic (so "cos x" keeps x apart from cos)
+    _it = "\u210e" if _k == 7 else chr(0x1D44E + _k)
+    _CAMBRIA[3028 + _k] = _it
+    _CAMBRIA[3276 + _k] = _it
+for _k in range(26):
+    _CAMBRIA[2911 + _k] = chr(ord("a") + _k)   # script-size upright letters (cos, sin in an exponent)
+for _k in range(25):
+    _CAMBRIA[3080 + _k] = chr(0x1D6FC + _k)    # script-size italic Greek alpha..omega (theta/2, pi/4)                   # script-size italic Greek (theta/2, pi/4)
+for _k in range(7):
+    _CAMBRIA[4666 + 6 * _k] = "("              # round brackets, normal and larger sizes
+    _CAMBRIA[4667 + 6 * _k] = ")"
 for _k, _c in enumerate("0123456789"):
     _CAMBRIA[882 + _k] = _c    # full-size digits (used when the font's own table was stripped)
 _CAMBRIA.update({3397: "+", 3398: "−", 3404: "=", 4666: "(", 4667: ")"})
-_CAMBRIA.update({3095: "π", 3427: "[", 3431: "]", 3435: "(", 3439: ")", 3505: "∫", 3628: "|",
+_CAMBRIA.update({ 3427: "[", 3431: "]", 3435: "(", 3439: ")", 3505: "∫", 3628: "|",
                  4672: "(", 4673: ")"})
 
 

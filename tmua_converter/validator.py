@@ -396,6 +396,12 @@ def validate_paper(data: Any, *, expected_questions: int | None = None, expected
         elif nr:
             r.add("info", "needs-review", "flagged for manual review", qn, "needsReview")
 
+    if katex_errors is None:  # no browser render: run the bundled KaTeX through Node.js instead
+        from .katex_node import check_paper
+
+        katex_errors = check_paper(data)
+        if katex_errors is None:
+            r.add("info", "katex-skipped", "KaTeX check skipped: Node.js is not installed")
     if katex_errors:
         for (qn, fld), msg in sorted(katex_errors.items()):
             r.add("error", "katex", f"KaTeX cannot render this: {msg}", qn, fld)

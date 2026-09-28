@@ -151,3 +151,17 @@ def test_command_katex_cannot_draw_is_an_error():
     r = ValidationReport()
     check_string(r, "Let $\\lcm(a, b)$ and $\\operatorname{hcf}(a, b)$ be given.", 1, "stem")
     assert [i.code for i in r.errors] == ["katex-unsupported"]
+
+
+def test_katex_through_node_catches_what_it_cannot_draw():
+    import pytest
+
+    from tmua_converter.katex_node import check_paper, node_available
+
+    if not node_available():
+        pytest.skip("needs Node.js")
+    data = {"questions": [{"number": 1, "stem": "Fine $\\frac{1}{2}$, bad $x^$ and $\\lcm(a)$",
+                           "options": [{"label": "A", "content": "$$\\int_0^1 x\\,dx$$"}]}]}
+    errors = check_paper(data)
+    assert set(errors) == {(1, "stem")}
+    assert "x^" in errors[(1, "stem")] and "lcm" in errors[(1, "stem")]

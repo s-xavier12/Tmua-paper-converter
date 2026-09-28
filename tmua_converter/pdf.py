@@ -27,7 +27,17 @@ MODEL_LONG_EDGE = 2576  # max image long edge used by current Claude vision mode
 _ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"), None)
 # Fonts LaTeX's picture mode uses to draw slanted lines and circles: graphics, not text.
 _DRAWING_FONT_RE = re.compile(r"^(LINE|LCIRCLE|LCIRCLEW)\d*", re.I)
-_OPTION_LABEL_RE = re.compile(r"^\(?[A-H][.)]?(?:\s|$)")
+def _picture_of_text(b: "Box", words) -> bool:
+    """A pasted screenshot of text, not a graph or diagram: several real words (3+ letters with a
+    vowel) that cover a real share of the picture.  OCR of grid lines gives "Ce", "LA", "aa"."""
+    inside = [w for w in words if b.x0 <= (w[0] + w[2]) / 2 <= b.x1 and b.y0 <= (w[1] + w[3]) / 2 <= b.y1]
+    real = [w for w in inside if re.fullmatch(r"[A-Za-z]{3,}", w[4].strip(".,;:?!()'\"")) and
+            re.search(r"[aeiouy]", w[4], re.I)]
+    area = sum((w[2] - w[0]) * (w[3] - w[1]) for w in real)
+    return len(real) >= 4 and area >= 0.015 * b.width * b.height
+
+
+_OPTION_LABEL_RE = re.compile(r"^\(?[A-J][.)]?(?:\s|$)")
 _NUMBER_ONLY_RE = re.compile(r"[\-–—\s]*\(?\d{1,3}[.):]?[\-–—\s]*")
 # Lines that start with a question marker: never running headers, even when a
 # question happens to start at the same height on many pages.
@@ -223,9 +233,7 @@ class PdfDocument:
                 else:
                     cand = pg.get_textpage_ocr(dpi=300, full=False, tessdata=tessdata)
                     words = pg.get_text("words", textpage=cand)
-                    texty = [b for b in big_images
-                             if sum(1 for w in words if b.x0 <= (w[0] + w[2]) / 2 <= b.x1
-                                    and b.y0 <= (w[1] + w[3]) / 2 <= b.y1 and re.search(r"[A-Za-z]{2}", w[4])) >= 4]
+                    texty = [b for b in big_images if _picture_of_text(b, words)]
                     if texty:  # a picture of text (e.g. a pasted screenshot of a question)
                         tp = cand
                         self.ocr_areas[page] = texty
@@ -453,7 +461,14 @@ class PdfDocument:
             return True
         # Bare page numbers sit in the top/bottom margin away from the left edge;
         # a bare number at the left margin is a question marker, not furniture.
-        return in_margin and bool(_NUMBER_ONLY_RE.fullmatch(ln.text)) and ln.box.x0 > box.width * 0.25
+        if not (in_margin and bool(_NUMBER_ONLY_RE.fullmatch(ln.text)) and ln.box.x0 > box.width * 0.25):
+            return False
+        # a page number stands alone; a small number beside text is part of it (an exponent, a numerator)
+        h = max(ln.box.height, 1.0)
+        return not any(o is not ln and not _NUMBER_ONLY_RE.fullmatch(o.text)
+                       and min(o.box.y1, ln.box.y1) - max(o.box.y0, ln.box.y0) > 0.2 * h
+                       and (o.box.x0 - ln.box.x1 < 3 * h and ln.box.x0 - o.box.x1 < 3 * h)
+                       for o in self.lines(page))
 
     def content_lines(self, page: int) -> list[TextLine]:
         return [ln for ln in self.lines(page) if not self.is_furniture(ln, page)]
