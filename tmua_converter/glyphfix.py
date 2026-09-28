@@ -19,6 +19,9 @@ for _k, _c in enumerate("0123456789+−"):
 for _k in range(26):
     _CAMBRIA[3028 + _k] = chr(ord("a") + _k)   # script-size italic letters
     _CAMBRIA[3276 + _k] = chr(ord("a") + _k)   # scriptscript-size italic letters
+for _k, _c in enumerate("0123456789"):
+    _CAMBRIA[882 + _k] = _c    # full-size digits (used when the font's own table was stripped)
+_CAMBRIA.update({3397: "+", 3398: "−", 3404: "=", 4666: "(", 4667: ")"})
 _CAMBRIA.update({3095: "π", 3427: "[", 3431: "]", 3435: "(", 3439: ")", 3505: "∫", 3628: "|",
                  4672: "(", 4673: ")"})
 
@@ -40,6 +43,18 @@ def plausible(c: str) -> bool:
     return unicodedata.category(c) in ("Zs",)
 
 
+def repair_for(doc) -> "GlyphRepair":
+    """One GlyphRepair per open document (it caches fonts and glyph traces)."""
+    rep = getattr(doc, "_tmua_glyph_repair", None)
+    if rep is None:
+        rep = GlyphRepair(doc)
+        try:
+            doc._tmua_glyph_repair = rep
+        except AttributeError:
+            pass
+    return rep
+
+
 class GlyphRepair:
     """Per-document: maps (font name, glyph id) to the real character."""
 
@@ -47,6 +62,8 @@ class GlyphRepair:
         self.doc = doc
         self._fonts: dict[str, dict[int, str] | None] = {}
         self._trace: dict[int, dict[tuple[int, int], tuple[str, int]]] = {}
+        self._font_is_cambria: dict[str, bool] = {}
+        self._math: dict[str, bool] = {}
 
     def _reverse_cmap(self, fontname: str, page) -> dict[int, str] | None:
         if fontname in self._fonts:
@@ -62,6 +79,8 @@ class GlyphRepair:
                 except Exception:  # noqa: BLE001 - unreadable font: no table
                     font = None
                 if font is not None:
+                    self._font_is_cambria[_key(fontname)] = "cambria" in font.name.lower() \
+                        or font.glyph_count == 7614 or font.has_glyph(0x30) == 882
                     table = {}
                     for rng in ((0x20, 0x250), (0x370, 0x400), (0x2000, 0x2C00), (0x1D400, 0x1D800)):
                         for o in range(*rng):
@@ -71,6 +90,25 @@ class GlyphRepair:
                 break
         self._fonts[fontname] = table
         return table
+
+    def is_math_font(self, fontname: str, page) -> bool:
+        """A maths font under any name: its file has maths italic letters (Cambria Math, STIX, ...)."""
+        key = _key(fontname)
+        if key not in self._math:
+            self._math[key] = False
+            for f in page.get_fonts():
+                if _key(f[3]) == key:
+                    try:
+                        import pymupdf
+
+                        buf = self.doc.extract_font(f[0])[3]
+                        font = pymupdf.Font(fontbuffer=buf) if buf else None
+                        self._math[key] = bool(font and (font.has_glyph(0x1D465) or font.has_glyph(0x1D44E)
+                                                         or "math" in font.name.lower()))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    break
+        return self._math[key]
 
     def _glyph_ids(self, page) -> dict[tuple[int, int], tuple[str, int]]:
         key = page.number
@@ -94,6 +132,11 @@ class GlyphRepair:
         table = self._reverse_cmap(font, page) or {}
         if gid in table:
             return table[gid]
-        if "CambriaMath" in font.replace(" ", ""):
+        # Word's maths font, whatever the PDF calls it ("CambriaMath", "CIDFont+F4", ...): recognised by
+        # its name inside the font file, by its glyph layout, or by the broken PDF reporting the glyph
+        # number itself as the character
+        cambria = ("cambriamath" in _key(font) or self._font_is_cambria.get(_key(font))
+                   or ord(c) == gid)
+        if cambria:
             return _CAMBRIA.get(gid)
         return None

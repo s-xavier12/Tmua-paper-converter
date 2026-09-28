@@ -22,7 +22,7 @@ import re
 import statistics
 import unicodedata
 
-from .glyphfix import GlyphRepair, plausible
+from .glyphfix import plausible, repair_for
 from dataclasses import replace, dataclass, field
 
 # --------------------------------------------------------------------------- character tables
@@ -66,6 +66,8 @@ OPERATORNAME_ONLY = {"lcm", "hcf"}
 def function_tex(word: str) -> str:
     return "\\operatorname{" + word + "}" if word in OPERATORNAME_ONLY else "\\" + word
 RADICAL = "√"
+# fonts renamed by the PDF writer ("CIDFont+F4", "F1", "T3Font_2"): look inside the font file
+GENERIC_FONT_RE = re.compile(r"^(?:[A-Z]{6}\+)?(?:CIDFont\+)?(?:F\d+|CIDFont.*|T3Font.*|Font\d*|R\d+|TT\d+)$", re.I)
 
 # Computer Modern extension font (LaTeX's big delimiters, operators, radicals),
 # indexed by character code as the PDF reports it.
@@ -319,7 +321,8 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                 ocr = "GlyphLess" in font
                 bold = not ocr and (bool(flags & 16) or bool(BOLD_RE.search(font)))
                 italic = not ocr and (bool(flags & 2) or bool(ITALIC_RE.search(font)))
-                math_font = not ocr and bool(MATH_FONT_RE.search(font))
+                math_font = not ocr and (bool(MATH_FONT_RE.search(font)) or (
+                    GENERIC_FONT_RE.match(font) is not None and repair_for(page.parent).is_math_font(font, page)))
                 for ch in span.get("chars", []):
                     c = ch.get("c", "")
                     if ch.get("dropped"):
@@ -330,7 +333,7 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                     if not c or c.isspace() or c in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
                         continue
                     if not plausible(c):
-                        repair = repair or GlyphRepair(page.parent)
+                        repair = repair or repair_for(page.parent)
                         fixed = repair.fix(page, c, ch.get("origin", (0, 0)), span.get("font", ""))
                         c = fixed if fixed else "\ufffd"
                     norm, known = normalise_char(c, font)

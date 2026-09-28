@@ -144,6 +144,10 @@ def test_broken_unicode_is_repaired_from_the_font(tmp_path):
         cmap = re.sub(r"<([0-9a-fA-F]{4})> <([0-9a-fA-F]{4})> <([0-9a-fA-F]{4})>", split, cmap)
         cmap = re.sub(r"(\d+) beginbfrange", lambda m: f"{int(m.group(1)) + 2} beginbfrange", cmap, count=1)
         doc.update_stream(cmap_xref, cmap.encode("latin1"))
+    for xref in range(1, doc.xref_length()):  # PDF writers often rename fonts, e.g. "CIDFont+F4"
+        for key in ("BaseFont", "FontName"):
+            if doc.xref_get_key(xref, key)[0] == "name":
+                doc.xref_set_key(xref, key, "/CIDFont+F4")
     doc.save(tmp_path / "p.pdf")
     assert "12" not in pymupdf.open(tmp_path / "p.pdf")[0].get_text()  # the text layer really is broken
     q = convert_pdf(tmp_path / "p.pdf", ConvertOptions(render_check=False), tmp_path).paper.questions[0]
