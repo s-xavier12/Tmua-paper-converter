@@ -113,3 +113,39 @@ def test_question_number_is_not_in_the_text(tmp_path, p_number_x, twice):
     assert [q.stem for q in qs] == stems
     assert [[o.content for o in q.options] for q in qs] == [[f"${n * 10 + i}$" for i in range(4)] for n in (1, 2, 3)]
     assert not any(q.needsReview for q in qs)
+
+
+def test_broken_unicode_is_repaired_from_the_font(tmp_path):
+    """A PDF whose character table maps digits to nothing: readers then report the glyph number,
+    which lands in scripts such as Oriya.  The real digits come back from the embedded font."""
+    import re
+
+    p = Page()
+    p.t(50, 60, "1", "Bold")
+    p.t(70, 60, "Work out 12 + 34 and 56 + 78.")
+    for i in range(4):
+        p.t(70, 90 + 18 * i, "ABCD"[i], "Bold")
+        p.t(95, 90 + 18 * i, str(90 + i))
+    p.doc.save(tmp_path / "good.pdf")
+    doc = pymupdf.open(tmp_path / "good.pdf")
+    for xref in range(1, doc.xref_length()):
+        if doc.xref_get_key(xref, "ToUnicode")[0] != "xref":
+            continue
+        cmap_xref = int(doc.xref_get_key(xref, "ToUnicode")[1].split()[0])
+        cmap = doc.xref_stream(cmap_xref).decode("latin1")
+        # point the digits at Oriya letters, as a broken PDF effectively does
+        def split(m):
+            a, b, u = (int(g, 16) for g in m.groups())
+            if not u <= 0x30 and 0x39 <= u + b - a:
+                return m.group(0)
+            d0 = a + 0x30 - u
+            return (f"<{a:04x}> <{d0 - 1:04x}> <{u:04x}>\n<{d0:04x}> <{d0 + 9:04x}> <0b30>\n"
+                    f"<{d0 + 10:04x}> <{b:04x}> <003a>")
+        cmap = re.sub(r"<([0-9a-fA-F]{4})> <([0-9a-fA-F]{4})> <([0-9a-fA-F]{4})>", split, cmap)
+        cmap = re.sub(r"(\d+) beginbfrange", lambda m: f"{int(m.group(1)) + 2} beginbfrange", cmap, count=1)
+        doc.update_stream(cmap_xref, cmap.encode("latin1"))
+    doc.save(tmp_path / "p.pdf")
+    assert "12" not in pymupdf.open(tmp_path / "p.pdf")[0].get_text()  # the text layer really is broken
+    q = convert_pdf(tmp_path / "p.pdf", ConvertOptions(render_check=False), tmp_path).paper.questions[0]
+    assert q.stem == "Work out $12 + 34$ and $56 + 78$."
+    assert [o.content for o in q.options] == ["$90$", "$91$", "$92$", "$93$"]

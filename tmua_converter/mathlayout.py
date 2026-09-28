@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 import statistics
 import unicodedata
+
+from .glyphfix import GlyphRepair, plausible
 from dataclasses import replace, dataclass, field
 
 # --------------------------------------------------------------------------- character tables
@@ -265,6 +267,36 @@ def _ink_extent(dl, page_rect, x0: float, x1: float, y0: float, y1: float, size:
     return clip.y0 + best[0] / zoom, clip.y0 + (best[1] + 1) / zoom
 
 
+def _replace_broken_chars(page, raw: dict) -> dict:
+    """Characters with implausible Unicode (a broken text layer) are dropped from *raw* and taken
+    again from the page's glyph trace, which has their true position and glyph number."""
+    broken = any(not plausible(c.get("c", " ")) for b in raw.get("blocks", []) for ln in b.get("lines", [])
+                 for sp in ln.get("spans", []) for c in sp.get("chars", []))
+    if not broken:
+        return raw
+    blocks = []
+    for b in raw.get("blocks", []):
+        lines = []
+        for ln in b.get("lines", []):
+            spans = [dict(sp, chars=[c if plausible(c.get("c", " ")) else {"c": "", "dropped": True}
+                                     for c in sp.get("chars", [])])
+                     for sp in ln.get("spans", [])]
+            lines.append(dict(ln, spans=spans))
+        blocks.append(dict(b, lines=lines))
+    try:
+        trace = page.get_texttrace()
+    except Exception:  # noqa: BLE001
+        trace = []
+    for sp in trace:
+        chars = [{"c": chr(c[0]), "origin": c[2], "bbox": c[3]} for c in sp.get("chars", ())
+                 if not plausible(chr(c[0]))]
+        if chars:
+            span = {"font": sp.get("font", ""), "size": sp.get("size", 0), "flags": sp.get("flags", 0),
+                    "chars": [{"c": "", "dropped": True}] + chars}  # starts with no space before it
+            blocks.append({"type": 0, "lines": [{"spans": [span]}]})
+    return dict(raw, blocks=blocks)
+
+
 def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
     """All visible characters on a PyMuPDF page (spaces dropped, drawing fonts skipped).
 
@@ -272,8 +304,10 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
     """
     out: list[Glyph] = []
     spaced = False
+    repair = None
     dl = None
     raw = raw if raw is not None else page.get_text("rawdict")
+    raw = _replace_broken_chars(page, raw)
     for block in raw.get("blocks", []):
         for line in block.get("lines", []):
             for span in line.get("spans", []):
@@ -288,10 +322,17 @@ def page_glyphs(page, page_no: int, raw: dict | None = None) -> list[Glyph]:
                 math_font = not ocr and bool(MATH_FONT_RE.search(font))
                 for ch in span.get("chars", []):
                     c = ch.get("c", "")
+                    if ch.get("dropped"):
+                        spaced = False  # a space before a re-read character belongs to that character
+                        continue
                     if c.isspace():
                         spaced = True
                     if not c or c.isspace() or c in ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"):
                         continue
+                    if not plausible(c):
+                        repair = repair or GlyphRepair(page.parent)
+                        fixed = repair.fix(page, c, ch.get("origin", (0, 0)), span.get("font", ""))
+                        c = fixed if fixed else "\ufffd"
                     norm, known = normalise_char(c, font)
                     x0, y0, x1, y1 = ch["bbox"]
                     if x1 - x0 <= 0.01 and y1 - y0 <= 0.01:
